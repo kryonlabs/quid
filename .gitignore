@@ -1,0 +1,47 @@
+# Build and CMake artifacts
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.lo
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exe
+
+# Generated binaries
+libquid.a
+libquid.so
+tests/test_identity
+tests/test_backup
+tests/test_integration_complete
+tests/test_auth
+examples/*_demo
+examples/simple_identity
+examples/production_test
+examples/adapter_demo
+examples/quid_demo
+
+# IDE/editor noise
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Logs and coverage
+*.log
+*.gcda
+*.gcno
+*.lcov
+

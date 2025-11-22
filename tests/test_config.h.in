@@ -1,0 +1,16 @@
+/**
+ * @file test_config.h
+ * @brief Test configuration
+ *
+ * Copyright (c) 2025 QUID Identity Foundation
+ * License: 0BSD (Zero-clause BSD)
+ */
+
+#ifndef QUID_TEST_CONFIG_H
+#define QUID_TEST_CONFIG_H
+
+#define QUID_TEST_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define QUID_TEST_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define QUID_TEST_VERSION_PATCH @PROJECT_VERSION_PATCH@
+
+#endif /* QUID_TEST_CONFIG_H */
