@@ -1,0 +1,51 @@
+# Fuzzing dictionary for QUID identity operations
+# This helps fuzzer find interesting input patterns
+
+# Network types
+"bitcoin"
+"bitcoin-test"
+"ssh"
+"webauthn"
+"ethereum"
+"cosmos"
+"polkadot"
+"solana"
+
+# Common application IDs
+"mainnet"
+"testnet"
+"regtest"
+"signet"
+"github.com"
+"gitlab.com"
+"google.com"
+"example.com"
+
+# Security purposes
+"authentication"
+"signing"
+"encryption"
+"key-derivation"
+
+# BIP32 path patterns
+"m/44'/0'/0'/0/"
+"m/49'/0'/0'/0/"
+"m/84'/0'/0'/0/"
+"m/"
+
+# Metadata prefixes
+"challenge="
+"request="
+"context="
+
+# Common delimiters
+"/"
+"-"
+"_"
+"."
+
+# Magic numbers (hex-encoded)
+"51554944"  # "QUID" in hex
+"IDNT"      # Identity marker
+"AUTH"      # Auth marker
+"BACK"      # Backup marker

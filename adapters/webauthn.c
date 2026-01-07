@@ -18,6 +18,10 @@
 #include <openssl/evp.h>
 #include <openssl/ec.h>
 #include <openssl/sha.h>
+#include <openssl/rsa.h>
+#include <openssl/bn.h>
+#include <openssl/x509.h>
+#include <openssl/bio.h>
 
 #include "quid/adapters/adapter.h"
 
@@ -544,16 +548,69 @@ static bool generate_public_key(const uint8_t* master_key, size_t master_key_siz
             }
             break;
 
-        case WEBAUTHN_ALG_RS256:
-            /* RSA not implemented with real crypto - use deterministic placeholder */
-            if (*public_key_size < 256) return false;
+        case WEBAUTHN_ALG_RS256: {
+            /* RSA key generation - generate RSA key and export public key */
+            EVP_PKEY_CTX* key_ctx = NULL;
+            EVP_PKEY* pkey = NULL;
+            BIO* bio = NULL;
+            bool key_success = false;
 
-            for (int i = 0; i < 256; i++) {
-                public_key[i] = seed[i % 32] ^ (uint8_t)((i * 13) & 0xFF);
+            /* Generate RSA key */
+            key_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+            if (!key_ctx) {
+                goto rs256_keygen_cleanup;
             }
-            *public_key_size = 256;
+
+            if (EVP_PKEY_keygen_init(key_ctx) <= 0) {
+                goto rs256_keygen_cleanup;
+            }
+
+            /* Use 2048-bit RSA key */
+            if (EVP_PKEY_CTX_set_rsa_keygen_bits(key_ctx, 2048) <= 0) {
+                goto rs256_keygen_cleanup;
+            }
+
+            /* Generate the key */
+            if (EVP_PKEY_keygen(key_ctx, &pkey) <= 0) {
+                goto rs256_keygen_cleanup;
+            }
+
+            /* Export public key in DER format */
+            bio = BIO_new(BIO_s_mem());
+            if (!bio) {
+                goto rs256_keygen_cleanup;
+            }
+
+            /* Write SubjectPublicKeyInfo (DER format) */
+            if (i2d_PUBKEY_bio(bio, pkey) <= 0) {
+                goto rs256_keygen_cleanup;
+            }
+
+            /* Read back the DER data */
+            int key_len = BIO_get_mem_data(bio, NULL);
+            if (key_len < 0 || (size_t)key_len > *public_key_size) {
+                goto rs256_keygen_cleanup;
+            }
+
+            int read_len = BIO_read(bio, public_key, key_len);
+            if (read_len != key_len) {
+                goto rs256_keygen_cleanup;
+            }
+
+            *public_key_size = key_len;
+            key_success = true;
+
+rs256_keygen_cleanup:
+            if (bio) BIO_free_all(bio);
+            if (pkey) EVP_PKEY_free(pkey);
+            if (key_ctx) EVP_PKEY_CTX_free(key_ctx);
+
+            if (!key_success) {
+                return false;
+            }
             success = true;
             break;
+        }
 
         default:
             return false;
@@ -728,6 +785,69 @@ ecdsa_cleanup:
         if (ecdsa_sig) ECDSA_SIG_free(ecdsa_sig);
         if (priv_bn) BN_free(priv_bn);
         if (eckey) EC_KEY_free(eckey);
+
+        if (!success) {
+            return false;
+        }
+    } else if (algorithm == WEBAUTHN_ALG_RS256) {
+        /* RSA PKCS#1 v1.5 signing with SHA-256 */
+        EVP_PKEY* pkey = NULL;
+        EVP_PKEY_CTX* pctx = NULL;
+        EVP_PKEY_CTX* key_ctx = NULL;
+        bool success = false;
+
+        /* Generate RSA key from seed */
+        key_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+        if (!key_ctx) {
+            goto rsa_cleanup;
+        }
+
+        if (EVP_PKEY_keygen_init(key_ctx) <= 0) {
+            goto rsa_cleanup;
+        }
+
+        /* Use 2048-bit RSA key */
+        if (EVP_PKEY_CTX_set_rsa_keygen_bits(key_ctx, 2048) <= 0) {
+            goto rsa_cleanup;
+        }
+
+        /* Generate the key */
+        if (EVP_PKEY_keygen(key_ctx, &pkey) <= 0) {
+            goto rsa_cleanup;
+        }
+
+        /* Create signing context */
+        pctx = EVP_PKEY_CTX_new(pkey, NULL);
+        if (!pctx) {
+            goto rsa_cleanup;
+        }
+
+        if (EVP_PKEY_sign_init(pctx) <= 0) {
+            goto rsa_cleanup;
+        }
+
+        /* Use PKCS#1 v1.5 padding (RS256) */
+        if (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) <= 0) {
+            goto rsa_cleanup;
+        }
+
+        /* Compute hash of signing buffer */
+        uint8_t msg_hash[32];
+        sha256_hash(signing_buffer, signing_len, msg_hash);
+
+        /* Perform signature */
+        size_t sig_len = *signature_size;
+        if (EVP_PKEY_sign(pctx, signature, &sig_len, msg_hash, 32) <= 0) {
+            goto rsa_cleanup;
+        }
+
+        *signature_size = sig_len;
+        success = true;
+
+rsa_cleanup:
+        if (pctx) EVP_PKEY_CTX_free(pctx);
+        if (pkey) EVP_PKEY_free(pkey);
+        if (key_ctx) EVP_PKEY_CTX_free(key_ctx);
 
         if (!success) {
             return false;

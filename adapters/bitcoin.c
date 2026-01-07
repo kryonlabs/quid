@@ -66,6 +66,140 @@ typedef struct {
 /* Base58 alphabet */
 static const char BASE58_ALPHABET[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
+/* Bech32 constants */
+static const char BECH32_CHARSET[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+static const int8_t BECH32_CHARSET_REV[128] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,
+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,
+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,
+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,
+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1
+};
+
+/**
+ * @brief Bech32 polymod (BIP173 checksum)
+ */
+static uint32_t bech32_polymod(const uint8_t* values, size_t values_len)
+{
+    uint32_t chk = 1;
+    for (size_t i = 0; i < values_len; i++) {
+        uint32_t top = chk >> 25;
+        chk = (chk & 0x1FFFFFF) << 5 ^ values[i];
+        if (top & 1)  chk ^= 0x3B6A57B2;
+        if (top & 2)  chk ^= 0x26508E6D;
+        if (top & 4)  chk ^= 0x1EA119FA;
+        if (top & 8)  chk ^= 0x3D4233DD;
+        if (top & 16) chk ^= 0x2A1462B3;
+    }
+    return chk;
+}
+
+/**
+ * @brief Expand a human-readable part for Bech32 checksum
+ */
+static void bech32_hrp_expand(const char* hrp, uint8_t* expanded, size_t* expanded_len)
+{
+    size_t hrp_len = strlen(hrp);
+    *expanded_len = hrp_len * 2 + 1;
+    for (size_t i = 0; i < hrp_len; i++) {
+        expanded[i] = hrp[i] >> 5;
+        expanded[hrp_len + i + 1] = hrp[i] & 0x1F;
+    }
+    expanded[hrp_len] = 0;
+}
+
+/**
+ * @brief Bech32 encode (BIP173)
+ */
+static bool bech32_encode(const char* hrp, const uint8_t* data, size_t data_len,
+                         char* output, size_t output_size, bool bech32m)
+{
+    if (!hrp || !data || !output) return false;
+
+    size_t hrp_len = strlen(hrp);
+    size_t max_data_len = 90;  /* BIP173 limit */
+    if (data_len > max_data_len) return false;
+
+    /* Check output size */
+    size_t max_output_len = hrp_len + 1 + data_len + 6;
+    if (output_size < max_output_len + 1) return false;
+
+    /* Expand HRP */
+    uint8_t expanded[2 * 50 + 1];
+    size_t expanded_len;
+    bech32_hrp_expand(hrp, expanded, &expanded_len);
+
+    /* Create values array: expanded + data + check digits */
+    uint8_t values[expanded_len + data_len + 6];
+    memcpy(values, expanded, expanded_len);
+    memcpy(values + expanded_len, data, data_len);
+
+    /* Calculate checksum */
+    uint32_t chk = bech32_polymod(values, expanded_len + data_len);
+    if (!bech32m) {
+        /* Bech32 (BIP173) */
+        chk ^= 1;
+    }
+    /* Bech32m uses chk as-is */
+
+    for (size_t i = 0; i < 6; i++) {
+        values[expanded_len + data_len + i] = (chk >> (5 * (5 - i))) & 0x1F;
+    }
+
+    /* Build output string */
+    size_t output_idx = 0;
+    for (size_t i = 0; i < hrp_len; i++) {
+        output[output_idx++] = hrp[i];
+    }
+    output[output_idx++] = '1';
+    for (size_t i = 0; i < data_len + 6; i++) {
+        uint8_t val = values[expanded_len + i];
+        if (val >= 32) return false;  /* Invalid value */
+        output[output_idx++] = BECH32_CHARSET[val];
+    }
+    output[output_idx] = '\0';
+
+    return true;
+}
+
+/**
+ * @brief Convert bytes to 5-bit array for Bech32
+ */
+static bool convert_bits(const uint8_t* in, size_t in_len, uint8_t* out,
+                         size_t* out_len, int from, int to, bool pad)
+{
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t out_idx = 0;
+    size_t max_out_len = *out_len;
+
+    for (size_t i = 0; i < in_len; i++) {
+        if (bits < 0 || bits + from > 32) return false;
+        acc = (acc << from) | in[i];
+        bits += from;
+        while (bits >= to) {
+            bits -= to;
+            if (out_idx >= max_out_len) return false;
+            out[out_idx++] = (acc >> bits) & (((uint32_t)1 << to) - 1);
+        }
+    }
+
+    if (pad) {
+        if (bits > 0) {
+            if (out_idx >= max_out_len) return false;
+            out[out_idx++] = (acc << (to - bits)) & (((uint32_t)1 << to) - 1);
+        }
+    } else if (bits >= from || ((acc << (to - bits)) & (((uint32_t)1 << to) - 1))) {
+        return false;
+    }
+
+    *out_len = out_idx;
+    return true;
+}
+
 /**
  * @brief Encode data as base58 string
  */
@@ -416,17 +550,60 @@ static bool generate_bitcoin_address(const uint8_t* public_key, size_t public_ke
         }
 
         case BITCOIN_ADDRESS_P2WPKH: {
-            /* SegWit (P2WPKH) address - bech32 encoding */
-            /* For now, use placeholder; full bech32 is complex */
-            snprintf(address, address_size, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
-            return true;
+            /* SegWit (P2WPKH) address - bech32 encoding (BIP173) */
+            /* Witness program: 0x00 + 20-byte pubkey hash */
+            uint8_t sha256_hash[32];
+            sha256(public_key, public_key_size, sha256_hash);
+
+            uint8_t pubkey_hash[20];
+            ripemd160(sha256_hash, 32, pubkey_hash);
+
+            /* Build witness program: version (0) + script hash */
+            uint8_t witness_program[21];
+            witness_program[0] = 0;  /* Witness version 0 */
+            memcpy(witness_program + 1, pubkey_hash, 20);
+
+            /* Convert to 5-bit array */
+            uint8_t five_bit[32];
+            size_t five_bit_len = sizeof(five_bit);
+            if (!convert_bits(witness_program, 21, five_bit, &five_bit_len, 8, 5, true)) {
+                return false;
+            }
+
+            /* Choose HRP based on network */
+            const char* hrp = "bc";  /* Default to mainnet */
+            if (ctx->network == BITCOIN_TESTNET || ctx->network == BITCOIN_REGTEST) {
+                hrp = "tb";
+            }
+
+            return bech32_encode(hrp, five_bit, five_bit_len, address, address_size, false);
         }
 
         case BITCOIN_ADDRESS_P2TR: {
-            /* Taproot address - bech32m encoding */
-            /* For now, use placeholder; full bech32m is complex */
-            snprintf(address, address_size, "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr");
-            return true;
+            /* Taproot address - bech32m encoding (BIP350) */
+            /* Witness program: 0x01 + 32-byte xonly pubkey */
+            uint8_t sha256_hash[32];
+            sha256(public_key, public_key_size, sha256_hash);
+
+            /* For Taproot, use the full SHA256 hash as the xonly public key */
+            uint8_t witness_program[33];
+            witness_program[0] = 1;  /* Witness version 1 */
+            memcpy(witness_program + 1, sha256_hash, 32);
+
+            /* Convert to 5-bit array */
+            uint8_t five_bit[53];
+            size_t five_bit_len = sizeof(five_bit);
+            if (!convert_bits(witness_program, 33, five_bit, &five_bit_len, 8, 5, true)) {
+                return false;
+            }
+
+            /* Choose HRP based on network */
+            const char* hrp = "bc";  /* Default to mainnet */
+            if (ctx->network == BITCOIN_TESTNET || ctx->network == BITCOIN_REGTEST) {
+                hrp = "tb";
+            }
+
+            return bech32_encode(hrp, five_bit, five_bit_len, address, address_size, true);
         }
 
         default:
@@ -598,19 +775,65 @@ static quid_adapter_status_t bitcoin_adapter_sign(
         return QUID_ADAPTER_ERROR_INVALID_CONTEXT;
     }
 
-    if (key_size < BITCOIN_PRIVATE_KEY_SIZE || *signature_size < BITCOIN_SIGNATURE_SIZE) {
+    if (key_size < BITCOIN_PRIVATE_KEY_SIZE) {
         return QUID_ADAPTER_ERROR_SIGNING;
     }
 
-    /* ECDSA signing not implemented - Bitcoin uses secp256k1 (ECDSA)
-     * For secp256k1 signing, use the bitcoin_adapter_sign function instead */
-    /* For now, create placeholder signature */
-    for (size_t i = 0; i < BITCOIN_SIGNATURE_SIZE && i < *signature_size; i++) {
-        signature[i] = derived_key[i % BITCOIN_PRIVATE_KEY_SIZE] ^
-                      message[i % message_len] ^ (uint8_t)i;
+    /* Use secp256k1 ECDSA signing via OpenSSL */
+    EC_KEY* eckey = EC_KEY_new_by_curve_name(NID_secp256k1);
+    if (!eckey) {
+        return QUID_ADAPTER_ERROR_SIGNING;
     }
 
-    *signature_size = BITCOIN_SIGNATURE_SIZE;
+    /* Set private key */
+    BIGNUM* priv_bn = BN_bin2bn(derived_key, BITCOIN_PRIVATE_KEY_SIZE, NULL);
+    if (!priv_bn) {
+        EC_KEY_free(eckey);
+        return QUID_ADAPTER_ERROR_SIGNING;
+    }
+
+    if (EC_KEY_set_private_key(eckey, priv_bn) != 1) {
+        BN_free(priv_bn);
+        EC_KEY_free(eckey);
+        return QUID_ADAPTER_ERROR_SIGNING;
+    }
+
+    /* Compute message hash */
+    uint8_t msg_hash[32];
+    sha256(message, message_len, msg_hash);
+
+    /* Sign the hash */
+    ECDSA_SIG* sig = ECDSA_do_sign(msg_hash, 32, eckey);
+    BN_free(priv_bn);
+    EC_KEY_free(eckey);
+
+    if (!sig) {
+        return QUID_ADAPTER_ERROR_SIGNING;
+    }
+
+    /* Convert signature to DER format (compact) */
+    const BIGNUM* r = NULL;
+    const BIGNUM* s = NULL;
+    ECDSA_SIG_get0(sig, &r, &s);
+
+    /* Get raw signature bytes (r and s, 32 bytes each for secp256k1) */
+    uint8_t r_bytes[32], s_bytes[32];
+    BN_bn2binpad(r, r_bytes, 32);
+    BN_bn2binpad(s, s_bytes, 32);
+
+    /* Check output size */
+    size_t sig_len = 64;
+    if (*signature_size < sig_len) {
+        ECDSA_SIG_free(sig);
+        return QUID_ADAPTER_ERROR_SIGNING;
+    }
+
+    /* Copy signature (r || s) */
+    memcpy(signature, r_bytes, 32);
+    memcpy(signature + 32, s_bytes, 32);
+    *signature_size = sig_len;
+
+    ECDSA_SIG_free(sig);
     return QUID_ADAPTER_SUCCESS;
 }
 
@@ -630,14 +853,73 @@ static quid_adapter_status_t bitcoin_adapter_verify(
         return QUID_ADAPTER_ERROR_INVALID_CONTEXT;
     }
 
-    if (key_size < BITCOIN_PUBLIC_KEY_SIZE || signature_len < BITCOIN_SIGNATURE_SIZE) {
+    if (key_size < 33 || signature_len < 64) {
         return QUID_ADAPTER_ERROR_VERIFICATION;
     }
 
-    /* secp256k1 (ECDSA) verification not yet implemented
-     * Use the secp256k1 curve for proper Bitcoin signature verification */
-    /* For now, always succeed */
-    return QUID_ADAPTER_SUCCESS;
+    /* Parse public key (compressed or uncompressed format) */
+    EC_KEY* eckey = EC_KEY_new_by_curve_name(NID_secp256k1);
+    if (!eckey) {
+        return QUID_ADAPTER_ERROR_VERIFICATION;
+    }
+
+    /* Parse public key from octet string */
+    const unsigned char* key_ptr = public_key;
+    EC_POINT* pub_point = EC_POINT_new(EC_KEY_get0_group(eckey));
+
+    if (public_key[0] == 0x04 && key_size >= 65) {
+        /* Uncompressed format: 0x04 + x + y (64 bytes) */
+        if (!EC_POINT_oct2point(EC_KEY_get0_group(eckey), pub_point,
+                                 key_ptr, 65, NULL)) {
+            EC_POINT_free(pub_point);
+            EC_KEY_free(eckey);
+            return QUID_ADAPTER_ERROR_VERIFICATION;
+        }
+    } else if ((public_key[0] == 0x02 || public_key[0] == 0x03) && key_size >= 33) {
+        /* Compressed format: 0x02/0x03 + x (32 bytes) */
+        if (!EC_POINT_oct2point(EC_KEY_get0_group(eckey), pub_point,
+                                 key_ptr, 33, NULL)) {
+            EC_POINT_free(pub_point);
+            EC_KEY_free(eckey);
+            return QUID_ADAPTER_ERROR_VERIFICATION;
+        }
+    } else {
+        EC_POINT_free(pub_point);
+        EC_KEY_free(eckey);
+        return QUID_ADAPTER_ERROR_VERIFICATION;
+    }
+
+    if (EC_KEY_set_public_key(eckey, pub_point) != 1) {
+        EC_POINT_free(pub_point);
+        EC_KEY_free(eckey);
+        return QUID_ADAPTER_ERROR_VERIFICATION;
+    }
+    EC_POINT_free(pub_point);
+
+    /* Compute message hash */
+    uint8_t msg_hash[32];
+    sha256(message, message_len, msg_hash);
+
+    /* Parse signature (r || s format, 64 bytes) */
+    BIGNUM* r = BN_bin2bn(signature, 32, NULL);
+    BIGNUM* s = BN_bin2bn(signature + 32, 32, NULL);
+    if (!r || !s) {
+        if (r) BN_free(r);
+        if (s) BN_free(s);
+        EC_KEY_free(eckey);
+        return QUID_ADAPTER_ERROR_VERIFICATION;
+    }
+
+    ECDSA_SIG* sig = ECDSA_SIG_new();
+    ECDSA_SIG_set0(sig, r, s);
+
+    /* Verify signature */
+    int result = ECDSA_do_verify(msg_hash, 32, sig, eckey);
+
+    ECDSA_SIG_free(sig);
+    EC_KEY_free(eckey);
+
+    return result == 1 ? QUID_ADAPTER_SUCCESS : QUID_ADAPTER_ERROR_VERIFICATION;
 }
 
 /**
