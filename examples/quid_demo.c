@@ -233,8 +233,8 @@ void demo_multiple_identities(void)
             quid_identity_t* identity_a = NULL;
             quid_identity_t* identity_b = NULL;
 
-            status = quid_identity_from_seed(&identity_a, seed, QUID_SECURITY_LEVEL_3);
-            quid_status_t status2 = quid_identity_from_seed(&identity_b, seed, QUID_SECURITY_LEVEL_3);
+            status = quid_identity_from_seed(&identity_a, seed, sizeof(seed), QUID_SECURITY_LEVEL_3);
+            quid_status_t status2 = quid_identity_from_seed(&identity_b, seed, sizeof(seed), QUID_SECURITY_LEVEL_3);
 
             if (status == QUID_SUCCESS && status2 == QUID_SUCCESS) {
                 const char* id_a = quid_get_identity_id(identity_a);

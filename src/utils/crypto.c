@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -20,8 +21,8 @@
 #include "quid/quid.h"
 #include "constants.h"
 #include "random.h"
+#include "crypto.h"
 
-/* Include PQClean ML-DSA implementations */
 #include "../../PQClean/crypto_sign/ml-dsa-44/clean/api.h"
 #include "../../PQClean/crypto_sign/ml-dsa-65/clean/api.h"
 #include "../../PQClean/crypto_sign/ml-dsa-87/clean/api.h"
@@ -32,33 +33,28 @@
 void quid_crypto_shake256(const uint8_t* input, size_t input_len,
                          uint8_t* output, size_t output_len);
 
-/* ML-DSA parameter structure */
-typedef struct {
-    size_t public_key_size;
-    size_t private_key_size;
-    size_t signature_size;
-    int security_level;
-} ml_dsa_params_t;
-
 /* ML-DSA parameters for different security levels */
 const ml_dsa_params_t ml_dsa_params[] = {
     {   /* ML-DSA-44 */
         .public_key_size = QUID_MLDSA44_PUBLIC_KEY_SIZE,
         .private_key_size = QUID_MLDSA44_PRIVATE_KEY_SIZE,
         .signature_size = QUID_MLDSA44_SIGNATURE_SIZE,
-        .security_level = 1
+        .seed_size = QUID_SEED_SIZE,
+        .name = "ML-DSA-44"
     },
     {   /* ML-DSA-65 */
         .public_key_size = QUID_MLDSA65_PUBLIC_KEY_SIZE,
         .private_key_size = QUID_MLDSA65_PRIVATE_KEY_SIZE,
         .signature_size = QUID_MLDSA65_SIGNATURE_SIZE,
-        .security_level = 3
+        .seed_size = QUID_SEED_SIZE,
+        .name = "ML-DSA-65"
     },
     {   /* ML-DSA-87 */
         .public_key_size = QUID_MLDSA87_PUBLIC_KEY_SIZE,
         .private_key_size = QUID_MLDSA87_PRIVATE_KEY_SIZE,
         .signature_size = QUID_MLDSA87_SIGNATURE_SIZE,
-        .security_level = 5
+        .seed_size = QUID_SEED_SIZE,
+        .name = "ML-DSA-87"
     }
 };
 
@@ -82,22 +78,100 @@ bool quid_crypto_kdf(const uint8_t* input_key_material, size_t ikm_len,
         return false;
     }
 
+    const bool debug = getenv("QUID_DEBUG_KDF") != NULL;
+    if (debug) {
+        fprintf(stderr, "[debug] KDF start ikm=%p ikm_len=%zu info_len=%zu out_len=%zu\n",
+                (const void*)input_key_material, ikm_len, info ? info_len : 0, output_len);
+    }
+
+    quid_argon2_params_t params;
+    if (!quid_get_argon2_params(&params)) {
+        return false;
+    }
+
     /* Derive a salt from the context to ensure domain separation */
     uint8_t salt[QUID_KDF_SALT_SIZE];
     quid_crypto_shake256(info ? info : input_key_material,
                          info ? info_len : ikm_len,
                          salt, sizeof(salt));
 
-    /* Use Argon2id as a memory-hard KDF to resist GPU/ASIC cracking */
-    const uint32_t t_cost = 3;              /* iterations */
-    const uint32_t m_cost = 1 << 16;        /* memory cost in kibibytes (64 MiB) */
-    const uint32_t parallelism = 1;         /* lanes */
+    /* Argon2 limits password length; compress IKM to a fixed, high-entropy seed */
+    uint8_t ikm_compact[64];
+    quid_crypto_shake256(input_key_material, ikm_len, ikm_compact, sizeof(ikm_compact));
 
-    int rc = argon2id_hash_raw(t_cost, m_cost, parallelism,
-                               input_key_material, ikm_len,
+    /* Use Argon2id as a memory-hard KDF to resist GPU/ASIC cracking */
+    int rc = argon2id_hash_raw(params.t_cost, params.m_cost, params.parallelism,
+                               ikm_compact, sizeof(ikm_compact),
                                salt, sizeof(salt),
                                output, output_len);
+    if (debug) {
+        fprintf(stderr, "[debug] KDF ikm=%p ikm_len=%zu info_len=%zu rc=%d\n",
+                (const void*)input_key_material, ikm_len, info_len, rc);
+        if (rc != ARGON2_OK) {
+            fprintf(stderr, "argon2id_hash_raw failed: %s\n", argon2_error_message(rc));
+        }
+    }
     return rc == ARGON2_OK;
+}
+
+static uint32_t read_env_u32(const char* name, uint32_t fallback)
+{
+    const char* value = getenv(name);
+    if (!value) {
+        return fallback;
+    }
+
+    char* endptr = NULL;
+    unsigned long parsed = strtoul(value, &endptr, 10);
+    if (!endptr || *endptr != '\0' || parsed > UINT32_MAX) {
+        return fallback;
+    }
+    return (uint32_t)parsed;
+}
+
+bool quid_get_argon2_params(quid_argon2_params_t* params)
+{
+    if (!params) {
+        return false;
+    }
+
+    /* Defaults and security floors */
+    const uint32_t default_t = QUID_ARGON2_TIME_COST;
+    const uint32_t default_m = QUID_ARGON2_MEMORY_KIB;
+    const uint32_t default_p = QUID_ARGON2_PARALLELISM;
+    const uint64_t baseline_work = (uint64_t)default_t * (uint64_t)default_m;
+
+    uint32_t t_cost = read_env_u32("QUID_ARGON2_TIME_COST", default_t);
+    uint32_t m_cost = read_env_u32("QUID_ARGON2_MEMORY_KIB", default_m);
+    uint32_t parallelism = read_env_u32("QUID_ARGON2_PARALLELISM", default_p);
+
+    /* Clamp to minimums and sane maximums */
+    if (t_cost < QUID_ARGON2_MIN_TIME_COST) {
+        t_cost = QUID_ARGON2_MIN_TIME_COST;
+    }
+    if (m_cost < QUID_ARGON2_MIN_MEMORY_KIB) {
+        m_cost = QUID_ARGON2_MIN_MEMORY_KIB;
+    }
+    if (parallelism == 0) {
+        parallelism = 1;
+    } else if (parallelism > QUID_ARGON2_MAX_PARALLELISM) {
+        parallelism = QUID_ARGON2_MAX_PARALLELISM;
+    }
+
+    /* Keep total work >= baseline (time * memory) */
+    uint64_t total_work = (uint64_t)t_cost * (uint64_t)m_cost;
+    if (total_work < baseline_work) {
+        uint64_t required_t = (baseline_work + m_cost - 1) / m_cost;
+        if (required_t > UINT32_MAX) {
+            required_t = UINT32_MAX;
+        }
+        t_cost = (uint32_t)required_t;
+    }
+
+    params->t_cost = t_cost;
+    params->m_cost = m_cost;
+    params->parallelism = parallelism;
+    return true;
 }
 
 /**
@@ -126,6 +200,9 @@ bool quid_crypto_ml_dsa_keygen(const uint8_t* seed, size_t seed_size,
                                quid_security_level_t security_level)
 {
     bool deterministic = (seed && seed_size > 0);
+    (void)private_key_size;
+    (void)public_key_size;
+
     if (deterministic) {
         if (!quid_random_begin_deterministic(seed, seed_size)) {
             return false;
@@ -135,18 +212,15 @@ bool quid_crypto_ml_dsa_keygen(const uint8_t* seed, size_t seed_size,
     bool result = false;
     switch (security_level) {
         case QUID_SECURITY_LEVEL_1:
-            result = PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(
-                public_key, private_key) == 0;
+            result = PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(public_key, private_key) == 0;
             break;
 
         case QUID_SECURITY_LEVEL_3:
-            result = PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(
-                public_key, private_key) == 0;
+            result = PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(public_key, private_key) == 0;
             break;
 
         case QUID_SECURITY_LEVEL_5:
-            result = PQCLEAN_MLDSA87_CLEAN_crypto_sign_keypair(
-                public_key, private_key) == 0;
+            result = PQCLEAN_MLDSA87_CLEAN_crypto_sign_keypair(public_key, private_key) == 0;
             break;
 
         default:
@@ -169,6 +243,8 @@ bool quid_crypto_ml_dsa_sign(const uint8_t* private_key, size_t private_key_size
                              uint8_t* signature, size_t* signature_size,
                              quid_security_level_t security_level)
 {
+    (void)private_key_size;
+
     switch (security_level) {
         case QUID_SECURITY_LEVEL_1:
             return PQCLEAN_MLDSA44_CLEAN_crypto_sign_signature_ctx(
@@ -195,6 +271,7 @@ bool quid_crypto_ml_dsa_verify(const uint8_t* public_key, size_t public_key_size
                                const uint8_t* signature, size_t signature_size)
 {
     int result = -1;
+    (void)public_key_size;
 
     /* Determine security level from signature size */
     if (signature_size == QUID_MLDSA44_SIGNATURE_SIZE) {
@@ -232,6 +309,9 @@ bool quid_crypto_pbkdf(const char* password,
                        uint8_t* output,
                        size_t output_size)
 {
+    (void)memory_cost;
+    (void)parallelism;
+
     if (!password || !salt || !output || output_size == 0) {
         return false;
     }

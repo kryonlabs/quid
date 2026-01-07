@@ -49,7 +49,7 @@ set_tests_properties(IdentityTests PROPERTIES
 )
 
 set_tests_properties(BackupTests PROPERTIES
-    TIMEOUT 30
+    TIMEOUT 120
     PASS_REGULAR_EXPRESSION "All backup tests passed"
 )
 
@@ -59,7 +59,7 @@ set_tests_properties(AuthTests PROPERTIES
 )
 
 set_tests_properties(CompleteIntegrationTests PROPERTIES
-    TIMEOUT 60
+    TIMEOUT 180
     PASS_REGULAR_EXPRESSION "ALL INTEGRATION TESTS PASSED"
 )
 

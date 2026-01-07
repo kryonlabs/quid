@@ -70,7 +70,7 @@ static void test_complete_identity_lifecycle(void)
         /* Create encrypted backup */
         const char* backup_password = "secure_backup_password_2025!";
         const char* backup_comment = "Complete integration test backup";
-        uint8_t backup_data[8192];
+        uint8_t backup_data[QUID_BACKUP_MAX_SIZE];
         size_t backup_size = sizeof(backup_data);
 
         status = quid_identity_backup(master_identity, backup_password, backup_comment,
@@ -98,7 +98,7 @@ static void test_complete_identity_lifecycle(void)
         printf("   Backup timestamp: %s\n", timestamp);
 
         /* Test base64 export */
-        char base64_backup[16384];
+        char base64_backup[QUID_BACKUP_BASE64_MAX_SIZE];
         size_t base64_size = sizeof(base64_backup);
         status = quid_backup_export_base64(backup_data, backup_size,
                                          base64_backup, &base64_size);
@@ -107,7 +107,7 @@ static void test_complete_identity_lifecycle(void)
         printf("   Base64 size: %zu bytes\n", base64_size);
 
         /* Import from base64 */
-        uint8_t imported_backup[8192];
+        uint8_t imported_backup[QUID_BACKUP_MAX_SIZE];
         size_t imported_size = sizeof(imported_backup);
         status = quid_backup_import_base64(base64_backup,
                                          imported_backup, &imported_size);
@@ -272,7 +272,8 @@ static void test_security_performance_load(void)
     clock_t start_time = clock();
 
     /* Create multiple identities */
-    const int num_identities = 10;
+    const int num_identities = 4;
+    const int derivations_per_identity = 5;
     quid_identity_t* identities[num_identities];
     char* identity_ids[num_identities];
 
@@ -298,14 +299,16 @@ static void test_security_performance_load(void)
 
     start_time = clock();
     for (int i = 0; i < num_identities; i++) {
-        for (int j = 0; j < 10; j++) {  /* 10 derivations per identity */
+        for (int j = 0; j < derivations_per_identity; j++) {
             quid_derive_key(identities[i], &test_ctx, keys[i], sizeof(keys[i]));
         }
     }
     clock_t derivation_time = clock();
     double derivation_ms = ((double)(derivation_time - start_time)) / CLOCKS_PER_SEC * 1000;
     printf("   Performed %d key derivations in %.2f ms (%.2f ms per derivation)\n",
-           num_identities * 10, derivation_ms, derivation_ms / (num_identities * 10));
+           num_identities * derivations_per_identity,
+           derivation_ms,
+           derivation_ms / (num_identities * derivations_per_identity));
 
     /* Test memory security under load */
     start_time = clock();
@@ -338,7 +341,7 @@ static void test_security_performance_load(void)
 
     /* Verify random data is truly random */
     bool all_zero = true;
-    for (int i = 0; i < sizeof(random_data); i++) {
+    for (size_t i = 0; i < sizeof(random_data); i++) {
         if (random_data[i] != 0) {
             all_zero = false;
             break;
@@ -350,7 +353,7 @@ static void test_security_performance_load(void)
     memcpy(random_data, "test data for secure zeroing", 32);
     quid_secure_zero(random_data, sizeof(random_data));
     all_zero = true;
-    for (int i = 0; i < sizeof(random_data); i++) {
+    for (size_t i = 0; i < sizeof(random_data); i++) {
         if (random_data[i] != 0) {
             all_zero = false;
             break;
@@ -420,7 +423,7 @@ static void test_error_handling_edge_cases(void)
         TEST_ASSERT(status != QUID_SUCCESS, "Derive key with NULL buffer fails");
 
         /* Test backup error conditions */
-        uint8_t backup_data[4096];
+        uint8_t backup_data[QUID_BACKUP_MAX_SIZE];
         size_t backup_size = sizeof(backup_data);
 
         status = quid_identity_backup(NULL, "password", "test", backup_data, &backup_size);

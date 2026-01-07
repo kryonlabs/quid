@@ -13,8 +13,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <ctype.h>
+#include <stddef.h>
 
 #include <argon2.h>
+#include <openssl/evp.h>
 
 #include "quid/quid.h"
 #include "../utils/crypto.h"
@@ -26,8 +29,6 @@
 /* Backup format constants */
 #define QUID_BACKUP_VERSION 2
 #define QUID_BACKUP_MAGIC "QUID"
-#define QUID_BACKUP_HEADER_SIZE 256
-#define QUID_BACKUP_MAX_SIZE (1024 * 1024)  /* 1MB max backup size */
 
 /* Backup format fields */
 typedef struct {
@@ -99,22 +100,23 @@ static bool derive_encryption_key(const char* password,
 /**
  * @brief Encrypt identity data with AES-256-GCM
  */
-static bool encrypt_identity_data(const quid_identity_backup_data_t* identity_data,
+static bool encrypt_identity_data(const uint8_t* plaintext,
+                                  size_t plaintext_size,
                                   const uint8_t* key,
                                   const uint8_t* iv,
+                                  const uint8_t* aad,
+                                  size_t aad_size,
                                   uint8_t* ciphertext,
                                   size_t* ciphertext_size,
                                   uint8_t* tag)
 {
-    if (!identity_data || !key || !iv || !ciphertext || !ciphertext_size || !tag) {
+    if (!plaintext || !key || !iv || !ciphertext || !ciphertext_size || !tag) {
         return false;
     }
 
-    /* Encrypt the identity data */
-    size_t data_size = sizeof(quid_identity_backup_data_t);
     return quid_crypto_aead_encrypt(key, iv,
-                                   (const uint8_t*)identity_data, data_size,
-                                   NULL, 0,  /* No AAD for now */
+                                   plaintext, plaintext_size,
+                                   aad, aad_size,
                                    ciphertext, ciphertext_size, tag);
 }
 
@@ -126,18 +128,19 @@ static bool decrypt_identity_data(const uint8_t* ciphertext,
                                   const uint8_t* key,
                                   const uint8_t* iv,
                                   const uint8_t* tag,
-                                  quid_identity_backup_data_t* identity_data)
+                                  const uint8_t* aad,
+                                  size_t aad_size,
+                                  uint8_t* plaintext,
+                                  size_t* plaintext_size)
 {
-    if (!ciphertext || !key || !iv || !tag || !identity_data) {
+    if (!ciphertext || !key || !iv || !tag || !plaintext || !plaintext_size) {
         return false;
     }
 
-    /* Decrypt the identity data */
-    size_t output_size = sizeof(quid_identity_backup_data_t);
     return quid_crypto_aead_decrypt(key, iv,
                                    ciphertext, ciphertext_size,
-                                   NULL, 0,  /* No AAD for now */
-                                   tag, (uint8_t*)identity_data, &output_size);
+                                   aad, aad_size,
+                                   tag, plaintext, plaintext_size);
 }
 
 /**
@@ -169,10 +172,9 @@ quid_status_t quid_identity_backup(const quid_identity_t* identity,
         return QUID_ERROR_INVALID_PARAMETER;
     }
 
-    size_t required_size = sizeof(quid_backup_header_t) + sizeof(quid_identity_backup_data_t) + 32; /* Extra padding */
-    if (*backup_data_size < required_size) {
-        *backup_data_size = required_size;
-        return QUID_ERROR_BUFFER_TOO_SMALL;
+    quid_argon2_params_t argon2_params;
+    if (!quid_get_argon2_params(&argon2_params)) {
+        return QUID_ERROR_CRYPTOGRAPHIC;
     }
 
     /* Prepare identity backup data */
@@ -185,6 +187,25 @@ quid_status_t quid_identity_backup(const quid_identity_t* identity,
 
     size_t pk_size, sk_size, sig_size;
     QUID_MLDSA_PARAMS(id_internal->security_level, &pk_size, &sk_size, &sig_size);
+
+    /* Calculate plaintext and required buffer sizes */
+    const size_t plaintext_size = sk_size + pk_size +
+                                  sizeof(identity_data.id_string) +
+                                  sizeof(identity_data.security_level) +
+                                  sizeof(identity_data.creation_time) +
+                                  sizeof(identity_data.additional_data_size) +
+                                  identity_data.additional_data_size;
+    const size_t required_size = sizeof(quid_backup_header_t) + plaintext_size;
+
+    if (plaintext_size > QUID_BACKUP_MAX_SIZE || required_size > QUID_BACKUP_MAX_SIZE) {
+        *backup_data_size = required_size;
+        return QUID_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    if (*backup_data_size < required_size) {
+        *backup_data_size = required_size;
+        return QUID_ERROR_BUFFER_TOO_SMALL;
+    }
 
     /* Copy private/public data */
     memcpy(identity_data.master_keypair, id_internal->master_keypair, sk_size);
@@ -202,9 +223,10 @@ quid_status_t quid_identity_backup(const quid_identity_t* identity,
     strncpy(header.identity_id, identity_data.id_string, sizeof(header.identity_id) - 1);
     header.security_level = identity_data.security_level;
     header.encrypted_data_size = sizeof(quid_identity_backup_data_t);
-    header.argon2_time_cost = 3;
-    header.argon2_memory_kib = 1 << 16; /* 64 MiB */
-    header.argon2_parallelism = 1;
+    header.argon2_time_cost = argon2_params.t_cost;
+    header.argon2_memory_kib = argon2_params.m_cost;
+    header.argon2_parallelism = argon2_params.parallelism;
+    const size_t header_aad_size = offsetof(quid_backup_header_t, tag);
 
     /* Generate random salt and IV */
     quid_status_t status = quid_random_bytes(header.salt, sizeof(header.salt));
@@ -232,20 +254,51 @@ quid_status_t quid_identity_backup(const quid_identity_t* identity,
         return QUID_ERROR_CRYPTOGRAPHIC;
     }
 
+    /* Build plaintext payload with only the used key material */
+    uint8_t plaintext[QUID_BACKUP_MAX_SIZE];
+    size_t offset = 0;
+    memcpy(plaintext + offset, identity_data.master_keypair, sk_size);
+    offset += sk_size;
+    memcpy(plaintext + offset, identity_data.public_key, pk_size);
+    offset += pk_size;
+    memcpy(plaintext + offset, identity_data.id_string, sizeof(identity_data.id_string));
+    offset += sizeof(identity_data.id_string);
+    memcpy(plaintext + offset, &identity_data.security_level, sizeof(identity_data.security_level));
+    offset += sizeof(identity_data.security_level);
+    memcpy(plaintext + offset, &identity_data.creation_time, sizeof(identity_data.creation_time));
+    offset += sizeof(identity_data.creation_time);
+    memcpy(plaintext + offset, &identity_data.additional_data_size, sizeof(identity_data.additional_data_size));
+    offset += sizeof(identity_data.additional_data_size);
+    if (identity_data.additional_data_size > 0) {
+        memcpy(plaintext + offset, identity_data.additional_data, identity_data.additional_data_size);
+        offset += identity_data.additional_data_size;
+    }
+
+    if (offset != plaintext_size) {
+        quid_secure_zero(encryption_key, sizeof(encryption_key));
+        return QUID_ERROR_CRYPTOGRAPHIC;
+    }
+
     /* Encrypt identity data */
     uint8_t* encrypted_data = backup_data + sizeof(quid_backup_header_t);
-    size_t encrypted_size = sizeof(quid_identity_backup_data_t);
+    size_t encrypted_size = plaintext_size;
 
-    if (!encrypt_identity_data(&identity_data, encryption_key, header.iv,
+    /* Include header (without tag) as associated data to detect tampering */
+    header.encrypted_data_size = plaintext_size;
+
+    if (!encrypt_identity_data(plaintext, plaintext_size, encryption_key, header.iv,
+                               (const uint8_t*)&header, header_aad_size,
                                encrypted_data, &encrypted_size, header.tag)) {
         quid_secure_zero(encryption_key, sizeof(encryption_key));
+        quid_secure_zero(plaintext, sizeof(plaintext));
         return QUID_ERROR_CRYPTOGRAPHIC;
     }
 
     /* Update header with actual encrypted size */
     header.encrypted_data_size = encrypted_size;
 
-    /* Clear encryption key from memory */
+    /* Clear sensitive buffers from memory */
+    quid_secure_zero(plaintext, sizeof(plaintext));
     quid_secure_zero(encryption_key, sizeof(encryption_key));
 
     /* Serialize header to buffer */
@@ -296,17 +349,68 @@ quid_status_t quid_identity_restore(const uint8_t* backup_data,
     }
 
     /* Decrypt identity data */
-    quid_identity_backup_data_t identity_data;
+    if (header.encrypted_data_size > QUID_BACKUP_MAX_SIZE) {
+        quid_secure_zero(decryption_key, sizeof(decryption_key));
+        return QUID_ERROR_INVALID_FORMAT;
+    }
+
+    const size_t header_aad_size = offsetof(quid_backup_header_t, tag);
+    uint8_t plaintext[QUID_BACKUP_MAX_SIZE];
+    size_t plaintext_size = header.encrypted_data_size;
     const uint8_t* encrypted_data = backup_data + sizeof(quid_backup_header_t);
 
     if (!decrypt_identity_data(encrypted_data, header.encrypted_data_size,
-                               decryption_key, header.iv, header.tag, &identity_data)) {
+                               decryption_key, header.iv, header.tag,
+                               (const uint8_t*)&header, header_aad_size,
+                               plaintext, &plaintext_size)) {
         quid_secure_zero(decryption_key, sizeof(decryption_key));
         return QUID_ERROR_CRYPTOGRAPHIC;
     }
 
     /* Clear decryption key from memory */
     quid_secure_zero(decryption_key, sizeof(decryption_key));
+
+    /* Parse decrypted payload */
+    size_t pk_size, sk_size, sig_size;
+    QUID_MLDSA_PARAMS(header.security_level, &pk_size, &sk_size, &sig_size);
+
+    const size_t minimum_size = sk_size + pk_size +
+                                QUID_ID_ID_SIZE +
+                                sizeof(quid_security_level_t) +
+                                sizeof(uint64_t) +
+                                sizeof(size_t);
+    if (plaintext_size < minimum_size) {
+        quid_secure_zero(plaintext, sizeof(plaintext));
+        return QUID_ERROR_INVALID_FORMAT;
+    }
+
+    quid_identity_backup_data_t identity_data = {0};
+    size_t offset = 0;
+    memcpy(identity_data.master_keypair, plaintext + offset, sk_size);
+    offset += sk_size;
+    memcpy(identity_data.public_key, plaintext + offset, pk_size);
+    offset += pk_size;
+    memcpy(identity_data.id_string, plaintext + offset, sizeof(identity_data.id_string));
+    offset += sizeof(identity_data.id_string);
+    memcpy(&identity_data.security_level, plaintext + offset, sizeof(identity_data.security_level));
+    offset += sizeof(identity_data.security_level);
+    memcpy(&identity_data.creation_time, plaintext + offset, sizeof(identity_data.creation_time));
+    offset += sizeof(identity_data.creation_time);
+    memcpy(&identity_data.additional_data_size, plaintext + offset, sizeof(identity_data.additional_data_size));
+    offset += sizeof(identity_data.additional_data_size);
+
+    if (identity_data.additional_data_size > sizeof(identity_data.additional_data) ||
+        offset + identity_data.additional_data_size > plaintext_size) {
+        quid_secure_zero(plaintext, sizeof(plaintext));
+        return QUID_ERROR_INVALID_FORMAT;
+    }
+
+    if (identity_data.additional_data_size > 0) {
+        memcpy(identity_data.additional_data, plaintext + offset, identity_data.additional_data_size);
+        offset += identity_data.additional_data_size;
+    }
+
+    quid_secure_zero(plaintext, sizeof(plaintext));
 
     /* Reconstruct identity */
     quid_identity_internal_t* restored =
@@ -321,9 +425,6 @@ quid_status_t quid_identity_restore(const uint8_t* backup_data,
     restored->security_level = identity_data.security_level;
     restored->creation_time = identity_data.creation_time;
     restored->is_locked = false;
-
-    size_t pk_size, sk_size, sig_size;
-    QUID_MLDSA_PARAMS(restored->security_level, &pk_size, &sk_size, &sig_size);
 
     memcpy(restored->master_keypair, identity_data.master_keypair, sk_size);
     memcpy(restored->public_key, identity_data.public_key, pk_size);
@@ -434,45 +535,22 @@ quid_status_t quid_backup_export_base64(const uint8_t* backup_data,
         return QUID_ERROR_INVALID_PARAMETER;
     }
 
-    /* Simple base64 encoding implementation */
-    const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t output_index = 0;
-    size_t input_index = 0;
-
-    /* Calculate required size */
-    size_t required_size = ((backup_data_size + 2) / 3) * 4 + 1;
+    /* Calculate required size (including null terminator) */
+    size_t required_size = 4 * ((backup_data_size + 2) / 3) + 1;
     if (*base64_size < required_size) {
         *base64_size = required_size;
         return QUID_ERROR_BUFFER_TOO_SMALL;
     }
 
-    while (input_index < backup_data_size) {
-        uint32_t triple = 0;
-        int bytes_in_triple = 0;
-
-        /* Read up to 3 bytes */
-        for (int i = 0; i < 3 && input_index < backup_data_size; i++) {
-            triple = (triple << 8) | backup_data[input_index++];
-            bytes_in_triple++;
-        }
-
-        /* Pad the triple if necessary */
-        for (int i = bytes_in_triple; i < 3; i++) {
-            triple <<= 8;
-        }
-
-        /* Output 4 base64 characters */
-        for (int i = 18; i >= 0; i -= 6) {
-            if (i >= (3 - bytes_in_triple) * 8) {
-                base64_output[output_index++] = base64_chars[(triple >> i) & 0x3F];
-            } else {
-                base64_output[output_index++] = '=';
-            }
-        }
+    int encoded_len = EVP_EncodeBlock((unsigned char*)base64_output,
+                                      backup_data,
+                                      (int)backup_data_size);
+    if (encoded_len < 0) {
+        return QUID_ERROR_CRYPTOGRAPHIC;
     }
 
-    base64_output[output_index] = '\0';
-    *base64_size = output_index;
+    base64_output[encoded_len] = '\0';
+    *base64_size = (size_t)encoded_len;
 
     return QUID_SUCCESS;
 }
@@ -488,48 +566,40 @@ quid_status_t quid_backup_import_base64(const char* base64_input,
         return QUID_ERROR_INVALID_PARAMETER;
     }
 
-    /* Simple base64 decoding implementation */
-    const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    int base64_decode[256];
-
-    /* Build decode table */
-    for (int i = 0; i < 64; i++) {
-        base64_decode[(unsigned char)base64_chars[i]] = i;
+    size_t input_len = strlen(base64_input);
+    if (input_len == 0 || input_len % 4 != 0) {
+        return QUID_ERROR_INVALID_FORMAT;
     }
 
-    size_t input_len = strlen(base64_input);
-    size_t output_index = 0;
+    size_t padding = 0;
+    for (size_t i = 0; i < input_len; i++) {
+        char c = base64_input[i];
+        if (c == '=') {
+            padding++;
+        } else if (!isalnum((unsigned char)c) && c != '+' && c != '/') {
+            return QUID_ERROR_INVALID_FORMAT;
+        }
+    }
 
-    /* Calculate required size */
     size_t required_size = (input_len / 4) * 3;
     if (*backup_data_size < required_size) {
         *backup_data_size = required_size;
         return QUID_ERROR_BUFFER_TOO_SMALL;
     }
 
-    for (size_t i = 0; i < input_len; i += 4) {
-        if (i + 3 >= input_len) break;
-
-        uint32_t quadruple = 0;
-        int valid_chars = 4;
-
-        for (int j = 0; j < 4; j++) {
-            char c = base64_input[i + j];
-            if (c == '=') {
-                valid_chars--;
-                continue;
-            }
-            quadruple = (quadruple << 6) | base64_decode[(unsigned char)c];
-        }
-
-        /* Output up to 3 bytes */
-        for (int j = 16; j >= 0 && valid_chars > 1; j -= 8) {
-            if (j >= (4 - valid_chars) * 8) {
-                backup_data[output_index++] = (quadruple >> j) & 0xFF;
-            }
-        }
+    int decoded_len = EVP_DecodeBlock(backup_data,
+                                      (const unsigned char*)base64_input,
+                                      (int)input_len);
+    if (decoded_len < 0) {
+        return QUID_ERROR_INVALID_FORMAT;
     }
 
-    *backup_data_size = output_index;
+    if (padding > 2) {
+        return QUID_ERROR_INVALID_FORMAT;
+    }
+
+    decoded_len -= (int)padding;
+    *backup_data_size = (size_t)decoded_len;
+
     return QUID_SUCCESS;
 }

@@ -116,7 +116,7 @@ void demonstrate_basic_identity(void)
                signature.data[i*8+4], signature.data[i*8+5], signature.data[i*8+6], signature.data[i*8+7]);
     }
 
-    printf("Public key (%zu bytes) - skipping hex print to test\n", QUID_PUBLIC_KEY_SIZE);
+    printf("Public key (%zu bytes) - skipping hex print to test\n", (size_t)QUID_PUBLIC_KEY_SIZE);
     // print_hex(public_key, QUID_PUBLIC_KEY_SIZE, "  ");  // Temporarily disabled to test
 
     /* Debug: Check signature after print_hex(public_key) */

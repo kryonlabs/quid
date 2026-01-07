@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __unix__
 #include <unistd.h>
@@ -24,8 +25,34 @@
 
 #include "memory.h"
 
+/* Memory pool configuration */
+#define QUID_MEMORY_POOL_SIZE (64 * 1024)  /* 64KB pool */
+#define QUID_MAX_GUARD_REGIONS 16
+#define QUID_PAGE_SIZE 4096  /* Default, will be detected */
+
 /* Global memory state */
 static bool g_memory_initialized = false;
+static size_t g_page_size = 0;
+
+/* Memory pool structure */
+typedef struct {
+    uint8_t* base;
+    size_t size;
+    size_t used;
+    bool active;
+} memory_pool_t;
+
+static memory_pool_t g_memory_pool = {NULL, 0, 0, false};
+
+/* Guard region tracking */
+typedef struct {
+    void* address;
+    size_t size;
+    bool in_use;
+} guard_region_t;
+
+static guard_region_t g_guard_regions[QUID_MAX_GUARD_REGIONS] = {0};
+static size_t g_guard_region_count = 0;
 
 /**
  * @brief Compiler barrier to prevent optimization
@@ -40,6 +67,126 @@ static inline void memory_barrier(void)
 }
 
 /**
+ * @brief Detect system page size
+ */
+static size_t detect_page_size(void)
+{
+#ifdef __unix__
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size > 0) {
+        return (size_t)page_size;
+    }
+    /* Fallback to getpagesize */
+    return (size_t)getpagesize();
+#elif defined(_WIN32)
+    SYSTEM_INFO sys_info;
+    GetSystemInfo(&sys_info);
+    return sys_info.dwPageSize;
+#else
+    /* Default page size */
+    return QUID_PAGE_SIZE;
+#endif
+}
+
+/**
+ * @brief Initialize memory pool for small allocations
+ */
+static bool init_memory_pool(void)
+{
+    /* Allocate pool with guard pages */
+    size_t pool_size = QUID_MEMORY_POOL_SIZE;
+    size_t total_size = pool_size + (g_page_size * 2);  /* + guard pages */
+
+#ifdef __unix__
+    uint8_t* base = mmap(NULL, total_size,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1, 0);
+    if (base == MAP_FAILED) {
+        return false;
+    }
+
+    /* Protect first page (before pool) */
+    mprotect(base, g_page_size, PROT_NONE);
+
+    /* Protect last page (after pool) */
+    mprotect(base + g_page_size + pool_size, g_page_size, PROT_NONE);
+
+    g_memory_pool.base = base + g_page_size;  /* Pool starts after first guard page */
+    g_memory_pool.size = pool_size;
+    g_memory_pool.used = 0;
+    g_memory_pool.active = true;
+
+    return true;
+
+#elif defined(_WIN32)
+    /* Allocate with VirtualAlloc */
+    uint8_t* base = VirtualAlloc(NULL, total_size,
+                                  MEM_COMMIT | MEM_RESERVE,
+                                  PAGE_READWRITE);
+    if (!base) {
+        return false;
+    }
+
+    /* Protect guard pages */
+    DWORD old_protect;
+    VirtualProtect(base, g_page_size, PAGE_NOACCESS, &old_protect);
+    VirtualProtect(base + g_page_size + pool_size, g_page_size, PAGE_NOACCESS, &old_protect);
+
+    g_memory_pool.base = base + g_page_size;
+    g_memory_pool.size = pool_size;
+    g_memory_pool.used = 0;
+    g_memory_pool.active = true;
+
+    return true;
+#else
+    /* Fallback: no guard pages */
+    g_memory_pool.base = calloc(1, pool_size);
+    if (!g_memory_pool.base) {
+        return false;
+    }
+    g_memory_pool.size = pool_size;
+    g_memory_pool.used = 0;
+    g_memory_pool.active = true;
+    return true;
+#endif
+}
+
+/**
+ * @brief Cleanup memory pool
+ */
+static void cleanup_memory_pool(void)
+{
+    if (!g_memory_pool.active) {
+        return;
+    }
+
+#ifdef __unix__
+    uint8_t* allocation_base = g_memory_pool.base - g_page_size;
+    size_t total_size = g_memory_pool.size + (g_page_size * 2);
+
+    /* Zero before unmapping */
+    quid_secure_zero(g_memory_pool.base, g_memory_pool.size);
+
+    munmap(allocation_base, total_size);
+
+#elif defined(_WIN32)
+    /* Zero and free */
+    quid_secure_zero(g_memory_pool.base, g_memory_pool.size);
+    VirtualFree(g_memory_pool.base - g_page_size, 0, MEM_RELEASE);
+#else
+    /* Regular free */
+    quid_secure_zero(g_memory_pool.base, g_memory_pool.size);
+    free(g_memory_pool.base);
+#endif
+
+    g_memory_pool.base = NULL;
+    g_memory_pool.size = 0;
+    g_memory_pool.used = 0;
+    g_memory_pool.active = false;
+}
+
+/**
  * @brief Initialize secure memory subsystem
  */
 bool quid_memory_init(void)
@@ -48,12 +195,17 @@ bool quid_memory_init(void)
         return true;
     }
 
-    /* TODO: Initialize memory protection mechanisms */
-    /* This would include:
-     * - Page size detection
-     * - Memory pool initialization
-     * - Side-channel protection setup
-     */
+    /* Detect page size */
+    g_page_size = detect_page_size();
+    if (g_page_size == 0) {
+        g_page_size = QUID_PAGE_SIZE;  /* Use default */
+    }
+
+    /* Initialize memory pool with guard pages */
+    if (!init_memory_pool()) {
+        /* Pool initialization failed, but continue without it */
+        /* This is not fatal - allocations will fall back to mmap/malloc */
+    }
 
     g_memory_initialized = true;
     return true;
@@ -68,7 +220,19 @@ void quid_memory_cleanup(void)
         return;
     }
 
-    /* TODO: Cleanup memory pools and protections */
+    /* Cleanup memory pool */
+    cleanup_memory_pool();
+
+    /* Cleanup guard regions */
+    for (size_t i = 0; i < g_guard_region_count; i++) {
+        if (g_guard_regions[i].in_use) {
+            quid_memory_secure_free(g_guard_regions[i].address, g_guard_regions[i].size);
+            g_guard_regions[i].address = NULL;
+            g_guard_regions[i].size = 0;
+            g_guard_regions[i].in_use = false;
+        }
+    }
+    g_guard_region_count = 0;
 
     g_memory_initialized = false;
 }
@@ -81,18 +245,6 @@ void* quid_memory_secure_alloc(size_t size)
     if (size == 0 || !g_memory_initialized) {
         return NULL;
     }
-
-    /* Align size to page boundary for memory protection */
-#ifdef __unix__
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size > 0) {
-        size = (size + page_size - 1) & ~(page_size - 1);
-    }
-#elif defined(_WIN32)
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    size = (size + si.dwPageSize - 1) & ~(si.dwPageSize - 1);
-#endif
 
     void* ptr = NULL;
 

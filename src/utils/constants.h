@@ -49,6 +49,12 @@ extern "C" {
 
 #define QUID_KDF_SALT_SIZE              32      /* Key derivation salt size */
 #define QUID_DERIVED_KEY_SIZE           64      /* Derived key size for networks */
+#define QUID_ARGON2_TIME_COST           2         /* Argon2 default iterations */
+#define QUID_ARGON2_MEMORY_KIB          (1 << 15) /* Argon2 memory cost (32 MiB) */
+#define QUID_ARGON2_PARALLELISM         1         /* Argon2 lanes (parallelism) */
+#define QUID_ARGON2_MIN_TIME_COST       2         /* Minimum allowed iterations */
+#define QUID_ARGON2_MIN_MEMORY_KIB      (1 << 15) /* Minimum memory (32 MiB) */
+#define QUID_ARGON2_MAX_PARALLELISM     8         /* Maximum allowed lanes */
 
 /* =============================================================================
    BUFFER AND MEMORY CONSTANTS

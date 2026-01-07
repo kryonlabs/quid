@@ -61,7 +61,7 @@ static void test_basic_backup_restore(void)
         const char* password = "test_backup_password_123";
         const char* comment = "Test backup created by unit test";
 
-        uint8_t backup_data[4096];
+        uint8_t backup_data[QUID_BACKUP_MAX_SIZE];
         size_t backup_size = sizeof(backup_data);
 
         status = quid_identity_backup(original, password, comment,
@@ -151,7 +151,7 @@ static void test_backup_wrong_password(void)
         const char* wrong_password = "wrong_password_456";
 
         /* Create backup with correct password */
-        uint8_t backup_data[4096];
+        uint8_t backup_data[QUID_BACKUP_MAX_SIZE];
         size_t backup_size = sizeof(backup_data);
 
         status = quid_identity_backup(identity, correct_password, "Test backup",
@@ -202,7 +202,7 @@ static void test_backup_base64(void)
         const char* password = "base64_test_password";
 
         /* Create binary backup */
-        uint8_t binary_backup[4096];
+        uint8_t binary_backup[QUID_BACKUP_MAX_SIZE];
         size_t binary_size = sizeof(binary_backup);
 
         status = quid_identity_backup(identity, password, "Base64 test backup",
@@ -210,7 +210,7 @@ static void test_backup_base64(void)
         TEST_ASSERT_SUCCESS(status, "Create binary backup");
 
         /* Export to base64 */
-        char base64_backup[8192];
+        char base64_backup[QUID_BACKUP_BASE64_MAX_SIZE];
         size_t base64_size = sizeof(base64_backup);
 
         status = quid_backup_export_base64(binary_backup, binary_size,
@@ -222,7 +222,7 @@ static void test_backup_base64(void)
         printf("   Base64 backup (first 60 chars): %.60s...\n", base64_backup);
 
         /* Import from base64 */
-        uint8_t imported_backup[4096];
+        uint8_t imported_backup[QUID_BACKUP_MAX_SIZE];
         size_t imported_size = sizeof(imported_backup);
 
         status = quid_backup_import_base64(base64_backup,
@@ -272,7 +272,7 @@ static void test_backup_security_levels(void)
     const char* level_names[] = {"Level 1 (128-bit)", "Level 3 (192-bit)", "Level 5 (256-bit)"};
 
     const char* password = "security_level_test_password";
-    uint8_t backups[3][4096];
+    uint8_t backups[3][QUID_BACKUP_MAX_SIZE];
     size_t backup_sizes[3];
 
     for (int i = 0; i < 3; i++) {
@@ -345,7 +345,7 @@ static void test_backup_error_handling(void)
         const char* password = "error_test_password";
 
         /* Test backup with NULL parameters */
-        uint8_t backup_data[4096];
+        uint8_t backup_data[QUID_BACKUP_MAX_SIZE];
         size_t backup_size = sizeof(backup_data);
 
         status = quid_identity_backup(NULL, password, "test", backup_data, &backup_size);
@@ -380,7 +380,7 @@ static void test_backup_error_handling(void)
         TEST_ASSERT(status != QUID_SUCCESS, "Restore with NULL output fails");
 
         /* Test restore with corrupted data */
-        uint8_t corrupted_data[4096];
+        uint8_t corrupted_data[QUID_BACKUP_MAX_SIZE];
         memcpy(corrupted_data, backup_data, backup_size);
         corrupted_data[50] ^= 0xFF;  /* Corrupt some bytes */
 
@@ -402,7 +402,7 @@ static void test_backup_error_handling(void)
         TEST_ASSERT(status != QUID_SUCCESS, "Export base64 with NULL output fails");
 
         char invalid_base64[] = "!!!invalid_base64!!!";
-        uint8_t imported_data[4096];
+        uint8_t imported_data[QUID_BACKUP_MAX_SIZE];
         size_t imported_size = sizeof(imported_data);
         status = quid_backup_import_base64(invalid_base64, imported_data, &imported_size);
         TEST_ASSERT(status != QUID_SUCCESS, "Import invalid base64 fails");

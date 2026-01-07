@@ -104,7 +104,7 @@ void test_backup_functionality(void)
     const char* password = "test_production_backup_password";
     const char* comment = "Production test backup";
 
-    uint8_t backup_data[8192];
+    uint8_t backup_data[QUID_BACKUP_MAX_SIZE];
     size_t backup_size = sizeof(backup_data);
 
     status = quid_identity_backup(identity, password, comment, backup_data, &backup_size);

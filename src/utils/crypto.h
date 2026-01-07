@@ -203,4 +203,17 @@ bool quid_crypto_pbkdf(const char* password,
                        uint8_t* output,
                        size_t output_size);
 
+typedef struct {
+    uint32_t t_cost;
+    uint32_t m_cost;
+    uint32_t parallelism;
+} quid_argon2_params_t;
+
+/**
+ * @brief Get Argon2 parameters with runtime overrides (env) and security floors.
+ * Environment variables: QUID_ARGON2_TIME_COST, QUID_ARGON2_MEMORY_KIB, QUID_ARGON2_PARALLELISM.
+ * Values below minimums are clamped; total work is kept >= default baseline.
+ */
+bool quid_get_argon2_params(quid_argon2_params_t* params);
+
 #endif /* QUID_CRYPTO_H */

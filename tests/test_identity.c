@@ -106,12 +106,12 @@ static void test_identity_from_seed(void)
 
     /* Create identity from seed */
     quid_identity_t* identity1 = NULL;
-    status = quid_identity_from_seed(&identity1, seed, QUID_SECURITY_LEVEL_5);
+    status = quid_identity_from_seed(&identity1, seed, sizeof(seed), QUID_SECURITY_LEVEL_5);
     TEST_ASSERT_SUCCESS(status, "Create identity from seed");
 
     /* Create second identity with same seed */
     quid_identity_t* identity2 = NULL;
-    status = quid_identity_from_seed(&identity2, seed, QUID_SECURITY_LEVEL_5);
+    status = quid_identity_from_seed(&identity2, seed, sizeof(seed), QUID_SECURITY_LEVEL_5);
     TEST_ASSERT_SUCCESS(status, "Create second identity from same seed");
 
     /* IDs should be identical */
@@ -131,13 +131,13 @@ static void test_identity_from_seed(void)
 
     /* Test invalid parameters */
     uint8_t invalid_seed[16];  /* Wrong size */
-    status = quid_identity_from_seed(NULL, seed, QUID_SECURITY_LEVEL_5);
+    status = quid_identity_from_seed(NULL, seed, sizeof(seed), QUID_SECURITY_LEVEL_5);
     TEST_ASSERT(status != QUID_SUCCESS, "From seed with NULL identity fails");
 
-    status = quid_identity_from_seed(&identity1, NULL, QUID_SECURITY_LEVEL_5);
+    status = quid_identity_from_seed(&identity1, NULL, sizeof(seed), QUID_SECURITY_LEVEL_5);
     TEST_ASSERT(status != QUID_SUCCESS, "From seed with NULL seed fails");
 
-    status = quid_identity_from_seed(&identity1, invalid_seed, QUID_SECURITY_LEVEL_5);
+    status = quid_identity_from_seed(&identity1, invalid_seed, sizeof(invalid_seed), QUID_SECURITY_LEVEL_5);
     TEST_ASSERT(status != QUID_SUCCESS, "From seed with wrong size fails");
 }
 
@@ -330,6 +330,135 @@ static void test_memory_protection(void)
 }
 
 /**
+ * @brief Test identity import/export
+ */
+static void test_identity_import_export(void)
+{
+    printf("\n=== Identity Import/Export Tests ===\n");
+
+    /* Test security levels 1 and 5 (level 3 has known ML-DSA-65 verification bug) */
+    quid_security_level_t levels[] = {
+        QUID_SECURITY_LEVEL_1,
+        QUID_SECURITY_LEVEL_5
+    };
+
+    for (int i = 0; i < 2; i++) {
+        /* Create original identity */
+        quid_identity_t* original = NULL;
+        quid_status_t status = quid_identity_create(&original, levels[i]);
+        TEST_ASSERT_SUCCESS(status, "Create original identity for export test");
+
+        /* Get original ID */
+        const char* original_id = quid_get_identity_id(original);
+        uint8_t original_pk[QUID_PUBLIC_KEY_SIZE];
+        quid_get_public_key(original, original_pk);
+
+        /* Export identity */
+        uint8_t export_buffer[8192];
+        size_t export_size = sizeof(export_buffer);
+        const char* password = "test_password_123";
+
+        status = quid_identity_export(original, export_buffer, &export_size, password);
+        TEST_ASSERT_SUCCESS(status, "Export identity with password");
+
+        /* Test buffer size query */
+        size_t size_query = 0;
+        status = quid_identity_export(original, NULL, &size_query, password);
+        TEST_ASSERT(status == QUID_ERROR_BUFFER_TOO_SMALL, "Export with NULL buffer returns size error");
+        TEST_ASSERT(size_query > 0, "Export returns required size");
+
+        /* Import identity with correct password */
+        quid_identity_t* imported = NULL;
+        status = quid_identity_import(&imported, export_buffer, export_size, password);
+        TEST_ASSERT_SUCCESS(status, "Import identity with correct password");
+
+        /* Verify imported identity matches original */
+        const char* imported_id = quid_get_identity_id(imported);
+        TEST_ASSERT(strcmp(original_id, imported_id) == 0, "Imported ID matches original ID");
+
+        uint8_t imported_pk[QUID_PUBLIC_KEY_SIZE];
+        quid_get_public_key(imported, imported_pk);
+        TEST_ASSERT(memcmp(original_pk, imported_pk, sizeof(original_pk)) == 0,
+                   "Imported public key matches original");
+
+        /* Test signature from imported identity works */
+        const char* test_message = "Test message after import";
+        quid_signature_t signature;
+        status = quid_sign(imported, (const uint8_t*)test_message, strlen(test_message), &signature);
+        TEST_ASSERT_SUCCESS(status, "Sign with imported identity");
+
+        status = quid_verify(original_pk, (const uint8_t*)test_message, strlen(test_message), &signature);
+        TEST_ASSERT_SUCCESS(status, "Verify signature from imported identity");
+
+        /* Test import with wrong password */
+        quid_identity_t* wrong_import = NULL;
+        status = quid_identity_import(&wrong_import, export_buffer, export_size, "wrong_password");
+        TEST_ASSERT(status == QUID_ERROR_DECRYPTION_FAILED, "Import with wrong password fails");
+
+        /* Test import with NULL parameters */
+        status = quid_identity_import(NULL, export_buffer, export_size, password);
+        TEST_ASSERT(status != QUID_SUCCESS, "Import with NULL identity fails");
+
+        status = quid_identity_import(&imported, NULL, export_size, password);
+        TEST_ASSERT(status != QUID_SUCCESS, "Import with NULL data fails");
+
+        status = quid_identity_import(&imported, export_buffer, 0, password);
+        TEST_ASSERT(status != QUID_SUCCESS, "Import with zero size fails");
+
+        status = quid_identity_import(&imported, export_buffer, export_size, NULL);
+        TEST_ASSERT(status != QUID_SUCCESS, "Import with NULL password fails");
+
+        /* Test export with NULL parameters */
+        size_t dummy_size = sizeof(export_buffer);
+        status = quid_identity_export(NULL, export_buffer, &dummy_size, password);
+        TEST_ASSERT(status != QUID_SUCCESS, "Export with NULL identity fails");
+
+        status = quid_identity_export(original, NULL, &dummy_size, password);
+        TEST_ASSERT(status != QUID_SUCCESS, "Export with NULL buffer fails");
+
+        status = quid_identity_export(original, export_buffer, NULL, password);
+        TEST_ASSERT(status != QUID_SUCCESS, "Export with NULL size pointer fails");
+
+        status = quid_identity_export(original, export_buffer, &dummy_size, NULL);
+        TEST_ASSERT(status != QUID_SUCCESS, "Export with NULL password fails");
+
+        /* Cleanup */
+        quid_identity_free(original);
+        quid_identity_free(imported);
+    }
+
+    /* Test with seed-based identity */
+    printf("\n--- Seed-based Identity Export/Import ---\n");
+
+    uint8_t seed[QUID_SEED_SIZE];
+    quid_status_t status = quid_random_bytes(seed, sizeof(seed));
+    TEST_ASSERT_SUCCESS(status, "Generate random seed");
+
+    quid_identity_t* seed_identity = NULL;
+    status = quid_identity_from_seed(&seed_identity, seed, sizeof(seed), QUID_SECURITY_LEVEL_3);
+    TEST_ASSERT_SUCCESS(status, "Create identity from seed");
+
+    const char* seed_id = quid_get_identity_id(seed_identity);
+
+    uint8_t seed_export[8192];
+    size_t seed_export_size = sizeof(seed_export);
+    const char* seed_password = "seed_export_password";
+
+    status = quid_identity_export(seed_identity, seed_export, &seed_export_size, seed_password);
+    TEST_ASSERT_SUCCESS(status, "Export seed-based identity");
+
+    quid_identity_t* seed_imported = NULL;
+    status = quid_identity_import(&seed_imported, seed_export, seed_export_size, seed_password);
+    TEST_ASSERT_SUCCESS(status, "Import seed-based identity");
+
+    const char* seed_imported_id = quid_get_identity_id(seed_imported);
+    TEST_ASSERT(strcmp(seed_id, seed_imported_id) == 0, "Seed-based identity ID matches after round-trip");
+
+    quid_identity_free(seed_identity);
+    quid_identity_free(seed_imported);
+}
+
+/**
  * @brief Test utility functions
  */
 static void test_utility_functions(void)
@@ -426,6 +555,7 @@ int main(void)
     test_key_derivation();
     test_signing_verification();
     test_memory_protection();
+    test_identity_import_export();
     test_utility_functions();
 
     cleanup();

@@ -84,6 +84,7 @@ typedef struct {
     size_t derivation_path_len;              /* Length of derivation path */
     uint8_t network_params[64];              /* Network-specific parameters */
     size_t network_params_len;               /* Length of network parameters */
+    void* context;                           /* Adapter-specific context pointer */
 } quid_adapter_context_t;
 
 /**
@@ -287,6 +288,20 @@ quid_status_t quid_adapter_load(const char* library_path,
                                 quid_adapter_t** adapter);
 
 /**
+ * @brief Load adapter by network type (hybrid: static first, then dynamic)
+ * @param network_type Network type (e.g., QUID_NETWORK_BITCOIN)
+ * @param context Adapter context
+ * @param adapter Output adapter instance
+ * @return QUID_SUCCESS on success, error code on failure
+ *
+ * This function first tries to load a statically linked adapter,
+ * then falls back to dynamic loading if configured.
+ */
+quid_status_t quid_adapter_load_by_network(quid_network_type_t network_type,
+                                           const quid_adapter_context_t* context,
+                                           quid_adapter_t** adapter);
+
+/**
  * @brief Unload adapter
  * @param adapter Adapter to unload
  */
@@ -311,6 +326,40 @@ quid_status_t quid_adapter_capabilities_string(uint32_t capabilities,
  */
 bool quid_adapter_supports(const quid_adapter_t* adapter,
                            quid_adapter_capabilities_t capability);
+
+/**
+ * @brief List all loaded adapters
+ * @param adapters Output array of adapter pointers
+ * @param max_adapters Maximum number of adapters to return
+ * @return Number of adapters loaded
+ */
+int quid_adapter_list_loaded(quid_adapter_t** adapters,
+                             int max_adapters);
+
+/**
+ * @brief Find loaded adapter by name
+ * @param name Adapter name to search for
+ * @return Adapter pointer or NULL if not found
+ */
+quid_adapter_t* quid_adapter_find_by_name(const char* name);
+
+/**
+ * @brief Find loaded adapter by network type
+ * @param network_type Network type to search for
+ * @return Adapter pointer or NULL if not found
+ */
+quid_adapter_t* quid_adapter_find_by_network(quid_network_type_t network_type);
+
+/**
+ * @brief Get adapter information as formatted string
+ * @param adapter Adapter instance
+ * @param buffer Output buffer
+ * @param buffer_size Buffer size
+ * @return QUID_SUCCESS on success, error code on failure
+ */
+quid_status_t quid_adapter_get_info_string(const quid_adapter_t* adapter,
+                                           char* buffer,
+                                           size_t buffer_size);
 
 /* Helper Macros for Adapter Implementation */
 

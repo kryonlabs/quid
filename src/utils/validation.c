@@ -14,6 +14,9 @@
 #include <stdbool.h>
 
 #include "quid/quid.h"
+#include "../core/identity_internal.h"
+#include "crypto.h"
+#include "constants.h"
 
 /**
  * @brief Validate security level parameter
@@ -71,7 +74,7 @@ bool quid_validate_signature(const quid_signature_t* signature)
 }
 
 /**
- * @brief Validate identity structure (basic checks)
+ * @brief Validate identity structure (comprehensive checks)
  */
 bool quid_validate_identity_structure(const quid_identity_t* identity)
 {
@@ -79,7 +82,53 @@ bool quid_validate_identity_structure(const quid_identity_t* identity)
         return false;
     }
 
-    /* Basic structure validation - more detailed validation happens in internal functions */
+    const quid_identity_internal_t* id_internal = (const quid_identity_internal_t*)identity;
+
+    /* Validate magic number */
+    if (id_internal->magic != QUID_IDENTITY_MAGIC) {
+        return false;
+    }
+
+    /* Validate security level */
+    if (!quid_validate_security_level(id_internal->security_level)) {
+        return false;
+    }
+
+    /* Validate creation time is reasonable (not zero, not too far in future) */
+    if (id_internal->creation_time == 0) {
+        return false;
+    }
+
+    /* Validate key sizes match security level */
+    /* Map security level (1, 3, 5) to array index (0, 1, 2) */
+    int level_index = (id_internal->security_level - 1) / 2;
+    if (level_index < 0 || level_index > 2) {
+        return false;
+    }
+
+    const ml_dsa_params_t* params = &ml_dsa_params[level_index];
+
+    /* Validate public key buffer is accessible */
+    if (!quid_validate_buffer(id_internal->public_key, params->public_key_size)) {
+        return false;
+    }
+
+    /* Validate private key buffer is accessible */
+    if (!quid_validate_buffer(id_internal->master_keypair, params->private_key_size)) {
+        return false;
+    }
+
+    /* Validate ID string is null-terminated */
+    if (id_internal->id_string[0] == '\0' ||
+        strlen(id_internal->id_string) >= QUID_ID_ID_SIZE) {
+        return false;
+    }
+
+    /* Validate ID string starts with expected prefix */
+    if (strncmp(id_internal->id_string, "quid", 4) != 0) {
+        return false;
+    }
+
     return true;
 }
 

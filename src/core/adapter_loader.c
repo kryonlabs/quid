@@ -2,8 +2,9 @@
  * @file adapter_loader.c
  * @brief QUID Adapter Loading Implementation
  *
- * Implements dynamic loading of network adapters from shared libraries.
- * Provides runtime adapter discovery and management functionality.
+ * Implements hybrid adapter loading: static registry for linked adapters
+ * and dynamic loading from shared libraries. Provides runtime adapter
+ * discovery and management functionality.
  *
  * Copyright (c) 2025 QUID Identity Foundation
  * License: 0BSD (Zero-clause BSD)
@@ -17,8 +18,29 @@
 #include "quid/quid.h"
 #include "quid/adapters/adapter.h"
 
+/* Static adapter declarations - unique symbols to avoid conflicts */
+extern quid_adapter_functions_t* bitcoin_quid_adapter_get_functions(void);
+extern quid_adapter_functions_t* ssh_quid_adapter_get_functions(void);
+extern quid_adapter_functions_t* webauthn_quid_adapter_get_functions(void);
+
 /* Maximum number of loaded adapters */
 #define MAX_LOADED_ADAPTERS 16
+
+/* Static adapter registry entry */
+typedef struct {
+    quid_network_type_t network;
+    const char* name;
+    quid_adapter_functions_t* (*get_functions_fn)(void);
+    bool is_available;
+} static_adapter_entry_t;
+
+/* Static adapter registry - built-in adapters linked at compile time */
+static static_adapter_entry_t g_static_adapters[] = {
+    { QUID_NETWORK_BITCOIN, "Bitcoin", bitcoin_quid_adapter_get_functions, false },
+    { QUID_NETWORK_SSH, "SSH", ssh_quid_adapter_get_functions, false },
+    { QUID_NETWORK_WEBAUTHN, "WebAuthn", webauthn_quid_adapter_get_functions, false },
+};
+static const size_t g_static_adapter_count = sizeof(g_static_adapters) / sizeof(g_static_adapters[0]);
 
 /* Loaded adapter tracking */
 typedef struct {
@@ -26,6 +48,7 @@ typedef struct {
     void* handle;
     quid_adapter_t* adapter;
     bool is_loaded;
+    bool is_static;  /* true = statically linked, false = dynamically loaded */
 } loaded_adapter_t;
 
 /* Global adapter registry */
@@ -45,8 +68,21 @@ static bool init_adapter_loader(void)
     /* Clear adapter registry */
     memset(g_loaded_adapters, 0, sizeof(g_loaded_adapters));
     g_adapter_count = 0;
-    g_loader_initialized = true;
 
+    /* Probe static adapters for availability */
+    for (size_t i = 0; i < g_static_adapter_count; i++) {
+        g_static_adapters[i].is_available = false;
+
+        /* Try to call the get_functions function to check if adapter is linked */
+        if (g_static_adapters[i].get_functions_fn) {
+            quid_adapter_functions_t* funcs = g_static_adapters[i].get_functions_fn();
+            if (funcs && funcs->abi_version == QUID_ADAPTER_ABI_VERSION) {
+                g_static_adapters[i].is_available = true;
+            }
+        }
+    }
+
+    g_loader_initialized = true;
     return true;
 }
 
@@ -81,6 +117,115 @@ static int find_free_slot(void)
         }
     }
     return -1;  /* No free slots */
+}
+
+/**
+ * @brief Internal helper to initialize adapter from function table
+ */
+static quid_status_t init_adapter_from_functions(
+    quid_adapter_functions_t* functions,
+    const quid_adapter_context_t* context,
+    const char* source_name,
+    bool is_static,
+    void* handle,
+    int slot,
+    quid_adapter_t** adapter)
+{
+    if (!functions) {
+        return QUID_ERROR_ADAPTER_ERROR;
+    }
+
+    /* Validate function table */
+    if (functions->abi_version != QUID_ADAPTER_ABI_VERSION) {
+        fprintf(stderr, "Adapter ABI version mismatch in '%s'\n", source_name);
+        return QUID_ERROR_INVALID_FORMAT;
+    }
+
+    if (!functions->init || !functions->cleanup || !functions->get_info) {
+        fprintf(stderr, "Required adapter functions missing in '%s'\n", source_name);
+        return QUID_ERROR_ADAPTER_ERROR;
+    }
+
+    /* Initialize adapter */
+    quid_adapter_t* new_adapter = functions->init(context);
+    if (!new_adapter) {
+        fprintf(stderr, "Failed to initialize adapter from '%s'\n", source_name);
+        return QUID_ERROR_ADAPTER_ERROR;
+    }
+
+    /* Validate adapter */
+    if (!new_adapter->is_initialized) {
+        fprintf(stderr, "Adapter not properly initialized from '%s'\n", source_name);
+        functions->cleanup(new_adapter);
+        return QUID_ERROR_ADAPTER_ERROR;
+    }
+
+    /* Store adapter information */
+    strncpy(g_loaded_adapters[slot].library_path, source_name,
+            sizeof(g_loaded_adapters[slot].library_path) - 1);
+    g_loaded_adapters[slot].handle = handle;
+    g_loaded_adapters[slot].adapter = new_adapter;
+    g_loaded_adapters[slot].is_loaded = true;
+    g_loaded_adapters[slot].is_static = is_static;
+
+    /* Store function pointer in adapter for convenience */
+    new_adapter->functions = functions;
+
+    if (slot >= g_adapter_count) {
+        g_adapter_count = slot + 1;
+    }
+
+    *adapter = new_adapter;
+    return QUID_SUCCESS;
+}
+
+/**
+ * @brief Load adapter by network type (hybrid: static first, then dynamic)
+ */
+quid_status_t quid_adapter_load_by_network(quid_network_type_t network_type,
+                                           const quid_adapter_context_t* context,
+                                           quid_adapter_t** adapter)
+{
+    if (!adapter) {
+        return QUID_ERROR_INVALID_PARAMETER;
+    }
+
+    if (!g_loader_initialized) {
+        if (!init_adapter_loader()) {
+            return QUID_ERROR_MEMORY_ALLOCATION;
+        }
+    }
+
+    /* First, check if adapter is already loaded */
+    for (int i = 0; i < g_adapter_count; i++) {
+        if (g_loaded_adapters[i].is_loaded &&
+            g_loaded_adapters[i].adapter->info.network_type == network_type) {
+            *adapter = g_loaded_adapters[i].adapter;
+            return QUID_SUCCESS;
+        }
+    }
+
+    /* Try static adapter registry first */
+    for (size_t i = 0; i < g_static_adapter_count; i++) {
+        if (g_static_adapters[i].network == network_type && g_static_adapters[i].is_available) {
+            int slot = find_free_slot();
+            if (slot < 0) {
+                return QUID_ERROR_MEMORY_ALLOCATION;
+            }
+
+            quid_adapter_functions_t* functions = g_static_adapters[i].get_functions_fn();
+            quid_status_t status = init_adapter_from_functions(
+                functions, context, g_static_adapters[i].name, true, NULL, slot, adapter);
+
+            if (status == QUID_SUCCESS) {
+                return QUID_SUCCESS;
+            }
+        }
+    }
+
+    /* Static adapter not found, return error */
+    /* Note: Could fall back to dynamic loading here if library path is known */
+    return QUID_ERROR_NOT_IMPLEMENTED;
 }
 
 /**
@@ -142,47 +287,15 @@ quid_status_t quid_adapter_load(const char* library_path,
         return QUID_ERROR_ADAPTER_ERROR;
     }
 
-    /* Validate function table */
-    if (functions->abi_version != QUID_ADAPTER_ABI_VERSION) {
-        fprintf(stderr, "Adapter ABI version mismatch in '%s'\n", library_path);
+    /* Use common initialization */
+    quid_status_t status = init_adapter_from_functions(
+        functions, context, library_path, false, handle, slot, adapter);
+
+    if (status != QUID_SUCCESS) {
         dlclose(handle);
-        return QUID_ERROR_INVALID_FORMAT;
+        return status;
     }
 
-    if (!functions->init || !functions->cleanup || !functions->get_info) {
-        fprintf(stderr, "Required adapter functions missing in '%s'\n", library_path);
-        dlclose(handle);
-        return QUID_ERROR_ADAPTER_ERROR;
-    }
-
-    /* Initialize adapter */
-    quid_adapter_t* new_adapter = functions->init(context);
-    if (!new_adapter) {
-        fprintf(stderr, "Failed to initialize adapter from '%s'\n", library_path);
-        dlclose(handle);
-        return QUID_ERROR_ADAPTER_ERROR;
-    }
-
-    /* Validate adapter */
-    if (!new_adapter->is_initialized) {
-        fprintf(stderr, "Adapter not properly initialized from '%s'\n", library_path);
-        functions->cleanup(new_adapter);
-        dlclose(handle);
-        return QUID_ERROR_ADAPTER_ERROR;
-    }
-
-    /* Store adapter information */
-    strncpy(g_loaded_adapters[slot].library_path, library_path,
-            sizeof(g_loaded_adapters[slot].library_path) - 1);
-    g_loaded_adapters[slot].handle = handle;
-    g_loaded_adapters[slot].adapter = new_adapter;
-    g_loaded_adapters[slot].is_loaded = true;
-
-    if (slot >= g_adapter_count) {
-        g_adapter_count = slot + 1;
-    }
-
-    *adapter = new_adapter;
     return QUID_SUCCESS;
 }
 
@@ -205,8 +318,8 @@ void quid_adapter_unload(quid_adapter_t* adapter)
                 adapter->functions->cleanup(adapter);
             }
 
-            /* Close shared library */
-            if (g_loaded_adapters[i].handle) {
+            /* Close shared library only for dynamically loaded adapters */
+            if (!g_loaded_adapters[i].is_static && g_loaded_adapters[i].handle) {
                 dlclose(g_loaded_adapters[i].handle);
             }
 

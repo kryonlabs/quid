@@ -37,7 +37,10 @@ typedef enum {
     QUID_ERROR_NOT_IMPLEMENTED = -6,
     QUID_ERROR_IDENTITY_NOT_FOUND = -7,
     QUID_ERROR_ADAPTER_ERROR = -8,
-    QUID_ERROR_QUANTUM_UNSAFE = -9
+    QUID_ERROR_QUANTUM_UNSAFE = -9,
+    QUID_ERROR_DECRYPTION_FAILED = -10,
+    QUID_ERROR_VERSION_MISMATCH = -11,
+    QUID_ERROR_INTEGRITY_CHECK_FAILED = -12
 } quid_status_t;
 
 /* Cryptographic Parameters */
@@ -48,6 +51,11 @@ typedef enum {
 #define QUID_CONTEXT_SIZE 256         /* Maximum context string size */
 #define QUID_DERIVED_KEY_SIZE 64      /* Maximum derived key size */
 #define QUID_ID_ID_SIZE 64            /* Identity ID string size */
+#define QUID_CHALLENGE_SIZE 32        /* Authentication challenge size */
+#define QUID_NONCE_SIZE 16            /* Authentication nonce size */
+#define QUID_BACKUP_HEADER_SIZE 128   /* Backup header size */
+#define QUID_BACKUP_MAX_SIZE 16384    /* Maximum backup size */
+#define QUID_BACKUP_BASE64_MAX_SIZE (QUID_BACKUP_MAX_SIZE * 2)
 
 /* Security Levels */
 typedef enum {
@@ -135,6 +143,7 @@ quid_status_t quid_identity_create(quid_identity_t** identity,
  */
 quid_status_t quid_identity_from_seed(quid_identity_t** identity,
                                       const uint8_t* seed,
+                                      size_t seed_size,
                                       quid_security_level_t security_level);
 
 /**

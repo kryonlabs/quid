@@ -15,6 +15,10 @@
 #include <stdint.h>
 #include <time.h>
 
+#include <openssl/evp.h>
+#include <openssl/ec.h>
+#include <openssl/sha.h>
+
 #include "quid/adapters/adapter.h"
 
 /* WebAuthn constants */
@@ -112,38 +116,318 @@ typedef struct {
     bool is_initialized;
 } webauthn_adapter_context_t;
 
-/* CBOR helper functions (simplified) */
+/* CBOR helper functions (RFC 8949) */
+/* CBOR major types */
+#define CBOR_MAJOR_UINT 0
+#define CBOR_MAJOR_NEGINT 1
+#define CBOR_MAJOR_BYTES 2
+#define CBOR_MAJOR_TEXT 3
+#define CBOR_MAJOR_ARRAY 4
+#define CBOR_MAJOR_MAP 5
+#define CBOR_MAJOR_TAG 6
+#define CBOR_MAJOR_SIMPLE 7
+
+/* CBOR additional info */
+#define CBOR_AI_1BYTE 24
+#define CBOR_AI_2BYTE 25
+#define CBOR_AI_4BYTE 26
+#define CBOR_AI_8BYTE 27
+#define CBOR_SIMPLE_FALSE (20)
+#define CBOR_SIMPLE_TRUE (21)
+#define CBOR_SIMPLE_NULL (22)
+
+/**
+ * @brief Write CBOR unsigned integer
+ */
+static bool cbor_encode_uint(uint64_t value, uint8_t* output, size_t* output_len)
+{
+    size_t needed;
+    if (value < 24) {
+        if (*output_len < 1) return false;
+        output[0] = (CBOR_MAJOR_UINT << 5) | (uint8_t)value;
+        *output_len = 1;
+        return true;
+    } else if (value <= 0xFF) {
+        needed = 2;
+        if (*output_len < needed) return false;
+        output[0] = (CBOR_MAJOR_UINT << 5) | CBOR_AI_1BYTE;
+        output[1] = (uint8_t)value;
+        *output_len = needed;
+        return true;
+    } else if (value <= 0xFFFF) {
+        needed = 3;
+        if (*output_len < needed) return false;
+        output[0] = (CBOR_MAJOR_UINT << 5) | CBOR_AI_2BYTE;
+        output[1] = (uint8_t)((value >> 8) & 0xFF);
+        output[2] = (uint8_t)(value & 0xFF);
+        *output_len = needed;
+        return true;
+    } else if (value <= 0xFFFFFFFF) {
+        needed = 5;
+        if (*output_len < needed) return false;
+        output[0] = (CBOR_MAJOR_UINT << 5) | CBOR_AI_4BYTE;
+        output[1] = (uint8_t)((value >> 24) & 0xFF);
+        output[2] = (uint8_t)((value >> 16) & 0xFF);
+        output[3] = (uint8_t)((value >> 8) & 0xFF);
+        output[4] = (uint8_t)(value & 0xFF);
+        *output_len = needed;
+        return true;
+    } else {
+        needed = 9;
+        if (*output_len < needed) return false;
+        output[0] = (CBOR_MAJOR_UINT << 5) | CBOR_AI_8BYTE;
+        output[1] = (uint8_t)((value >> 56) & 0xFF);
+        output[2] = (uint8_t)((value >> 48) & 0xFF);
+        output[3] = (uint8_t)((value >> 40) & 0xFF);
+        output[4] = (uint8_t)((value >> 32) & 0xFF);
+        output[5] = (uint8_t)((value >> 24) & 0xFF);
+        output[6] = (uint8_t)((value >> 16) & 0xFF);
+        output[7] = (uint8_t)((value >> 8) & 0xFF);
+        output[8] = (uint8_t)(value & 0xFF);
+        *output_len = needed;
+        return true;
+    }
+}
+
+/**
+ * @brief Write CBOR byte string
+ */
 static bool cbor_encode_bytes(const uint8_t* data, size_t len, uint8_t* output, size_t* output_len)
 {
-    /* Placeholder CBOR encoding */
-    if (*output_len < len + 4) return false;
+    size_t header_len = *output_len;
+    if (!cbor_encode_uint(len, output, &header_len)) {
+        return false;
+    }
+    /* Change major type to bytes */
+    output[0] = (CBOR_MAJOR_BYTES << 5) | (output[0] & 0x1F);
 
-    output[0] = 0x58;  /* CBOR byte string tag */
-    output[1] = (uint8_t)len;
-    memcpy(output + 2, data, len);
-    *output_len = len + 2;
+    if (*output_len < header_len + len) {
+        return false;
+    }
+
+    memcpy(output + header_len, data, len);
+    *output_len = header_len + len;
     return true;
 }
 
-static bool cbor_decode_bytes(const uint8_t* input, size_t input_len, uint8_t* output, size_t* output_len)
+/**
+ * @brief Write CBOR text string
+ */
+static bool cbor_encode_text(const char* text, uint8_t* output, size_t* output_len)
 {
-    /* Placeholder CBOR decoding */
-    if (input_len < 2 || input[0] != 0x58) return false;
+    size_t header_len = *output_len;
+    size_t text_len = strlen(text);
+    if (!cbor_encode_uint(text_len, output, &header_len)) {
+        return false;
+    }
+    /* Change major type to text */
+    output[0] = (CBOR_MAJOR_TEXT << 5) | (output[0] & 0x1F);
 
-    size_t len = input[1];
-    if (len > *output_len || len + 2 > input_len) return false;
+    if (*output_len < header_len + text_len) {
+        return false;
+    }
 
-    memcpy(output, input + 2, len);
-    *output_len = len;
+    memcpy(output + header_len, text, text_len);
+    *output_len = header_len + text_len;
+    return true;
+}
+
+/**
+ * @brief Write CBOR array header
+ */
+static bool cbor_encode_array(size_t count, uint8_t* output, size_t* output_len)
+{
+    if (!cbor_encode_uint(count, output, output_len)) {
+        return false;
+    }
+    /* Change major type to array */
+    output[0] = (CBOR_MAJOR_ARRAY << 5) | (output[0] & 0x1F);
+    return true;
+}
+
+/**
+ * @brief Write CBOR map header
+ */
+static bool cbor_encode_map(size_t count, uint8_t* output, size_t* output_len)
+{
+    if (!cbor_encode_uint(count, output, output_len)) {
+        return false;
+    }
+    /* Change major type to map */
+    output[0] = (CBOR_MAJOR_MAP << 5) | (output[0] & 0x1F);
+    return true;
+}
+
+/**
+ * @brief Decode CBOR byte string
+ */
+static bool cbor_decode_bytes(const uint8_t* input, size_t input_len,
+                              uint8_t* output, size_t* output_len)
+{
+    if (input_len == 0) return false;
+
+    uint8_t first_byte = input[0];
+    uint8_t major = (first_byte >> 5) & 0x07;
+    uint8_t ai = first_byte & 0x1F;
+
+    if (major != CBOR_MAJOR_BYTES) return false;
+
+    size_t offset = 1;
+    size_t data_len = 0;
+
+    /* Parse length */
+    if (ai < 24) {
+        data_len = ai;
+    } else if (ai == CBOR_AI_1BYTE) {
+        if (input_len < 2) return false;
+        data_len = input[1];
+        offset = 2;
+    } else if (ai == CBOR_AI_2BYTE) {
+        if (input_len < 3) return false;
+        data_len = ((size_t)input[1] << 8) | input[2];
+        offset = 3;
+    } else if (ai == CBOR_AI_4BYTE) {
+        if (input_len < 5) return false;
+        data_len = ((size_t)input[1] << 24) | ((size_t)input[2] << 16) |
+                   ((size_t)input[3] << 8) | input[4];
+        offset = 5;
+    } else {
+        return false;
+    }
+
+    if (input_len < offset + data_len) return false;
+    if (data_len > *output_len) return false;
+
+    memcpy(output, input + offset, data_len);
+    *output_len = data_len;
     return true;
 }
 
 /* SHA-256 helper */
 static void sha256_hash(const uint8_t* data, size_t len, uint8_t hash[32])
 {
-    /* Use QUID's SHA-256 implementation */
-    extern void quid_crypto_sha256(const uint8_t* input, size_t input_size, uint8_t* output);
-    quid_crypto_sha256(data, len, hash);
+    /* Use OpenSSL SHA-256 directly */
+    SHA256(data, len, hash);
+}
+
+/**
+ * @brief Generate Ed25519 key pair from seed using OpenSSL EVP API
+ */
+static bool generate_ed25519_keypair(const uint8_t* seed, uint8_t* public_key, uint8_t* private_key)
+{
+    if (!seed || !public_key || !private_key) {
+        return false;
+    }
+
+    EVP_PKEY* pkey = NULL;
+    bool success = false;
+
+    /* Create Ed25519 key from raw seed (32 bytes) */
+    pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, seed, 32);
+    if (!pkey) {
+        return false;
+    }
+
+    /* Extract raw private key */
+    size_t priv_len = 32;
+    if (EVP_PKEY_get_raw_private_key(pkey, private_key, &priv_len) <= 0) {
+        goto cleanup;
+    }
+
+    /* Extract raw public key */
+    size_t pub_len = 32;
+    if (EVP_PKEY_get_raw_public_key(pkey, public_key, &pub_len) <= 0) {
+        goto cleanup;
+    }
+
+    success = true;
+
+cleanup:
+    if (pkey) EVP_PKEY_free(pkey);
+    return success;
+}
+
+/**
+ * @brief Generate P-256 (ES256) key pair from seed using OpenSSL EC API
+ */
+static bool generate_p256_keypair(const uint8_t* seed, uint8_t* public_key, uint8_t* private_key)
+{
+    if (!seed || !public_key || !private_key) {
+        return false;
+    }
+
+    EC_KEY* eckey = NULL;
+    const EC_GROUP* group = NULL;
+    EC_POINT* pub_point = NULL;
+    BIGNUM* priv_bn = NULL;
+    BIGNUM* x = NULL;
+    BIGNUM* y = NULL;
+    bool success = false;
+
+    /* Create EC key for prime256v1 (P-256) */
+    eckey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    if (!eckey) {
+        goto cleanup;
+    }
+
+    group = EC_KEY_get0_group(eckey);
+    if (!group) {
+        goto cleanup;
+    }
+
+    /* Convert seed to private key (mod curve order) */
+    priv_bn = BN_bin2bn(seed, 32, NULL);
+    if (!priv_bn) {
+        goto cleanup;
+    }
+
+    if (!EC_KEY_set_private_key(eckey, priv_bn)) {
+        goto cleanup;
+    }
+
+    /* Derive public key */
+    pub_point = EC_POINT_new(group);
+    if (!pub_point) {
+        goto cleanup;
+    }
+
+    if (!EC_POINT_mul(group, pub_point, priv_bn, NULL, NULL, NULL)) {
+        goto cleanup;
+    }
+
+    if (!EC_KEY_set_public_key(eckey, pub_point)) {
+        goto cleanup;
+    }
+
+    /* Extract private key as bytes */
+    BN_bn2binpad(priv_bn, private_key, 32);
+
+    /* Extract public key in uncompressed format */
+    x = BN_new();
+    y = BN_new();
+    if (!x || !y) {
+        goto cleanup;
+    }
+
+    if (!EC_POINT_get_affine_coordinates_GFp(group, pub_point, x, y, NULL)) {
+        goto cleanup;
+    }
+
+    /* Uncompressed format: 0x04 + X + Y */
+    public_key[0] = 0x04;
+    BN_bn2binpad(x, public_key + 1, 32);
+    BN_bn2binpad(y, public_key + 33, 32);
+
+    success = true;
+
+cleanup:
+    if (x) BN_free(x);
+    if (y) BN_free(y);
+    if (priv_bn) BN_free(priv_bn);
+    if (pub_point) EC_POINT_free(pub_point);
+    if (eckey) EC_KEY_free(eckey);
+
+    return success;
 }
 
 /* Base64URL encoding */
@@ -224,54 +508,61 @@ static bool generate_public_key(const uint8_t* master_key, size_t master_key_siz
         return false;
     }
 
-    /* Generate deterministic key pair from master key */
+    /* Generate deterministic seed from master key using SHA-256 */
     uint8_t seed[32];
+    sha256_hash(master_key, master_key_size, seed);
+
+    /* Add algorithm-specific variation to seed */
     for (int i = 0; i < 32; i++) {
-        seed[i] = master_key[i % master_key_size] ^ (uint8_t)(i * 7);
+        seed[i] ^= (uint8_t)(algorithm & 0xFF);
+        seed[i] ^= (uint8_t)((i * 7) & 0xFF);
     }
+
+    uint8_t private_key[128];  /* Buffer for private key */
+    bool success = false;
 
     switch (algorithm) {
         case WEBAUTHN_ALG_ES256:
             /* Generate P-256 key pair */
             if (*public_key_size < 65) return false;
 
-            /* Uncompressed format: 0x04 + X + Y (each 32 bytes) */
-            public_key[0] = 0x04;
-            for (int i = 0; i < 32; i++) {
-                public_key[1 + i] = seed[i] ^ (uint8_t)((i * 3) & 0xFF);  /* X coordinate */
-                public_key[33 + i] = seed[i] ^ (uint8_t)((i * 5) & 0xFF); /* Y coordinate */
+            success = generate_p256_keypair(seed, public_key, private_key);
+            if (success) {
+                *public_key_size = 65;
+                quid_secure_zero(private_key, sizeof(private_key));
             }
-            *public_key_size = 65;
             break;
 
         case WEBAUTHN_ALG_ED25519:
             /* Generate Ed25519 key pair */
             if (*public_key_size < 32) return false;
 
-            for (int i = 0; i < 32; i++) {
-                public_key[i] = seed[i] ^ (uint8_t)((i * 11) & 0xFF);
+            success = generate_ed25519_keypair(seed, public_key, private_key);
+            if (success) {
+                *public_key_size = 32;
+                quid_secure_zero(private_key, sizeof(private_key));
             }
-            *public_key_size = 32;
             break;
 
         case WEBAUTHN_ALG_RS256:
-            /* Generate RSA public key (modulus only for demo) */
+            /* RSA not implemented with real crypto - use deterministic placeholder */
             if (*public_key_size < 256) return false;
 
             for (int i = 0; i < 256; i++) {
                 public_key[i] = seed[i % 32] ^ (uint8_t)((i * 13) & 0xFF);
             }
             *public_key_size = 256;
+            success = true;
             break;
 
         default:
             return false;
     }
 
-    return true;
+    return success;
 }
 
-/* Sign WebAuthn assertion */
+/* Sign WebAuthn assertion with real Ed25519/ECDSA signing */
 static bool sign_assertion(const uint8_t* master_key, size_t master_key_size,
                            const uint8_t* client_data, size_t client_data_size,
                            const uint8_t* auth_data, size_t auth_data_size,
@@ -282,24 +573,11 @@ static bool sign_assertion(const uint8_t* master_key, size_t master_key_size,
         return false;
     }
 
-    /* Hash client data and auth data */
-    uint8_t client_data_hash[32];
-    uint8_t auth_data_hash[32];
-    uint8_t combined_hash[64];
-
-    sha256_hash(client_data, client_data_size, client_data_hash);
-    sha256_hash(auth_data, auth_data_size, auth_data_hash);
-
-    /* Combine hashes for signature */
-    memcpy(combined_hash, auth_data, auth_data_size);
-    memcpy(combined_hash + auth_data_size, client_data_hash, 32);
-    size_t total_size = auth_data_size + 32;
-
-    /* Generate deterministic signature */
+    /* Determine required signature size */
     size_t required_size = 64;
     switch (algorithm) {
         case WEBAUTHN_ALG_ES256:
-            required_size = 64;  /* DER-encoded ECDSA signature */
+            required_size = 64;  /* DER-encoded ECDSA signature (r + s) */
             break;
         case WEBAUTHN_ALG_ED25519:
             required_size = 64;
@@ -311,14 +589,159 @@ static bool sign_assertion(const uint8_t* master_key, size_t master_key_size,
 
     if (*signature_size < required_size) return false;
 
-    /* Create signature from master key and data */
-    for (size_t i = 0; i < required_size && i < *signature_size; i++) {
-        uint8_t data_byte = combined_hash[i % total_size];
-        uint8_t key_byte = master_key[i % master_key_size];
-        signature[i] = data_byte ^ key_byte ^ (uint8_t)((i * algorithm) & 0xFF);
+    /* Generate deterministic seed from master key */
+    uint8_t seed[32];
+    sha256_hash(master_key, master_key_size, seed);
+    for (int i = 0; i < 32; i++) {
+        seed[i] ^= (uint8_t)(algorithm & 0xFF);
     }
 
-    *signature_size = required_size;
+    /* Prepare message to sign: client_data_hash || auth_data */
+    uint8_t client_data_hash[32];
+    sha256_hash(client_data, client_data_size, client_data_hash);
+
+    /* Create signing buffer */
+    uint8_t signing_buffer[512];
+    size_t signing_len = 0;
+
+    /* WebAuthn signature: auth_data || SHA256(client_data_hash) || auth_data */
+    memcpy(signing_buffer, auth_data, auth_data_size);
+    signing_len = auth_data_size;
+
+    if (signing_len + 32 <= sizeof(signing_buffer)) {
+        memcpy(signing_buffer + signing_len, client_data_hash, 32);
+        signing_len += 32;
+    }
+
+    /* Perform signing based on algorithm */
+    if (algorithm == WEBAUTHN_ALG_ED25519) {
+        /* Ed25519 signing using OpenSSL EVP API */
+        EVP_PKEY* pkey = NULL;
+        EVP_PKEY_CTX* pctx = NULL;
+        bool success = false;
+
+        /* Create Ed25519 key from seed */
+        pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, seed, 32);
+        if (!pkey) {
+            goto ed25519_cleanup;
+        }
+
+        /* Create signing context */
+        pctx = EVP_PKEY_CTX_new(pkey, NULL);
+        if (!pctx) {
+            goto ed25519_cleanup;
+        }
+
+        if (EVP_PKEY_sign_init(pctx) <= 0) {
+            goto ed25519_cleanup;
+        }
+
+        /* Perform signature */
+        size_t sig_len = *signature_size;
+        if (EVP_PKEY_sign(pctx, signature, &sig_len,
+                          signing_buffer, signing_len) <= 0) {
+            goto ed25519_cleanup;
+        }
+
+        *signature_size = sig_len;
+        success = true;
+
+ed25519_cleanup:
+        if (pctx) EVP_PKEY_CTX_free(pctx);
+        if (pkey) EVP_PKEY_free(pkey);
+
+        if (!success) {
+            return false;
+        }
+    } else if (algorithm == WEBAUTHN_ALG_ES256) {
+        /* ECDSA P-256 signing using OpenSSL EC API */
+        EC_KEY* eckey = NULL;
+        const EC_GROUP* group = NULL;
+        ECDSA_SIG* ecdsa_sig = NULL;
+        BIGNUM* priv_bn = NULL;
+        bool success = false;
+
+        /* Create EC key for P-256 */
+        eckey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+        if (!eckey) {
+            goto ecdsa_cleanup;
+        }
+
+        group = EC_KEY_get0_group(eckey);
+        if (!group) {
+            goto ecdsa_cleanup;
+        }
+
+        /* Set private key from seed */
+        priv_bn = BN_bin2bn(seed, 32, NULL);
+        if (!priv_bn) {
+            goto ecdsa_cleanup;
+        }
+
+        if (!EC_KEY_set_private_key(eckey, priv_bn)) {
+            goto ecdsa_cleanup;
+        }
+
+        /* Compute hash of signing buffer */
+        uint8_t msg_hash[32];
+        sha256_hash(signing_buffer, signing_len, msg_hash);
+
+        /* Sign with ECDSA */
+        ecdsa_sig = ECDSA_do_sign(msg_hash, 32, eckey);
+        if (!ecdsa_sig) {
+            goto ecdsa_cleanup;
+        }
+
+        /* Convert signature to DER format */
+        const BIGNUM* r = NULL;
+        const BIGNUM* s = NULL;
+        ECDSA_SIG_get0(ecdsa_sig, &r, &s);
+
+        /* Write DER-encoded signature: SEQUENCE { INTEGER r, INTEGER s } */
+        unsigned char* p = signature;
+        int r_len = BN_num_bytes(r);
+        int s_len = BN_num_bytes(s);
+        int total_len = 6 + r_len + s_len;  /* Approximate */
+
+        if (*signature_size < (size_t)total_len) {
+            goto ecdsa_cleanup;
+        }
+
+        /* Simple DER encoding for ECDSA signature */
+        *p++ = 0x30;  /* SEQUENCE tag */
+        *p++ = (unsigned char)(4 + r_len + s_len);  /* Length */
+
+        *p++ = 0x02;  /* INTEGER tag */
+        *p++ = (unsigned char)r_len;  /* Length */
+        BN_bn2bin(r, p);
+        p += r_len;
+
+        *p++ = 0x02;  /* INTEGER tag */
+        *p++ = (unsigned char)s_len;  /* Length */
+        BN_bn2bin(s, p);
+        p += s_len;
+
+        *signature_size = p - signature;
+        success = true;
+
+ecdsa_cleanup:
+        if (ecdsa_sig) ECDSA_SIG_free(ecdsa_sig);
+        if (priv_bn) BN_free(priv_bn);
+        if (eckey) EC_KEY_free(eckey);
+
+        if (!success) {
+            return false;
+        }
+    } else {
+        /* Fallback to deterministic XOR for unsupported algorithms */
+        for (size_t i = 0; i < required_size && i < *signature_size; i++) {
+            uint8_t data_byte = signing_buffer[i % signing_len];
+            uint8_t key_byte = seed[i % 32];
+            signature[i] = data_byte ^ key_byte ^ (uint8_t)((i * algorithm) & 0xFF);
+        }
+        *signature_size = required_size;
+    }
+
     return true;
 }
 
@@ -601,7 +1024,6 @@ static quid_adapter_functions_t webauthn_functions = {
     .get_info = webauthn_adapter_get_info,
     .derive_key = webauthn_adapter_derive_key,
     .derive_address = NULL,  /* WebAuthn doesn't use addresses */
-    .derive_public = webauthn_adapter_derive_public,
     .sign = webauthn_adapter_sign,
     .verify = webauthn_adapter_verify,
     .encrypt = NULL,
@@ -611,8 +1033,9 @@ static quid_adapter_functions_t webauthn_functions = {
 
 /**
  * @brief WebAuthn adapter entry point
+ * Note: Renamed to avoid symbol conflicts when statically linking multiple adapters
  */
-QUID_ADAPTER_EXPORT quid_adapter_functions_t* quid_adapter_get_functions(void)
+QUID_ADAPTER_EXPORT quid_adapter_functions_t* webauthn_quid_adapter_get_functions(void)
 {
     return &webauthn_functions;
 }
